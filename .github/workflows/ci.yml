@@ -1,0 +1,177 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+  workflow_dispatch:
+
+# h2mech 依赖同级的 ../netmech，所以两个仓都检出到同一个 workspace：
+#   $GITHUB_WORKSPACE/h2mech   ← 本仓
+#   $GITHUB_WORKSPACE/netmech  ← 依赖
+# CMake 默认就在 ../netmech 找它，不用额外传 -DH2MECH_NETMECH_DIR。
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux / GCC + Clang
+  # ---------------------------------------------------------------------------
+  linux:
+    name: Linux / ${{ matrix.compiler }} / ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+
+    steps:
+      - name: 检出 h2mech
+        uses: actions/checkout@v4
+        with:
+          path: h2mech
+
+      - name: 检出 netmech（依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: goldhalo/netmech
+          path: netmech
+
+      - name: 安装工具
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          if [ "${{ matrix.compiler }}" = "gcc" ]; then
+            sudo apt-get install -y g++
+          else
+            clang++ --version || { echo "::error::runner 上没有预装 clang++"; exit 1; }
+          fi
+
+      - name: 配置
+        working-directory: h2mech
+        run: |
+          if [ "${{ matrix.compiler }}" = "gcc" ]; then
+            export CC=gcc CXX=g++
+          else
+            export CC=clang CXX=clang++
+          fi
+          cmake -S . -B build -G Ninja \
+                -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+                -DH2MECH_WARNINGS_AS_ERRORS=ON
+
+      - name: 构建
+        working-directory: h2mech
+        run: cmake --build build --parallel
+
+      - name: 测试
+        working-directory: h2mech
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
+      - name: 直接运行测试（失败时取详细输出）
+        if: failure()
+        working-directory: h2mech
+        run: ./build/bin/h2mech_ut || true
+
+  # ---------------------------------------------------------------------------
+  # Windows / MSVC（Ninja + msvc-dev-cmd：VS 生成器的探测在 runner 镜像升级后
+  # 反复失效，与其它 mech 仓保持一致）
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Windows / MSVC / ${{ matrix.build_type }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [Debug, Release]
+
+    steps:
+      - name: 检出 h2mech
+        uses: actions/checkout@v4
+        with:
+          path: h2mech
+
+      - name: 检出 netmech（依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: goldhalo/netmech
+          path: netmech
+
+      - name: 配置 MSVC 环境
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: 配置
+        shell: pwsh
+        working-directory: h2mech
+        run: |
+          $out  = cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DH2MECH_WARNINGS_AS_ERRORS=ON 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 0) {
+            $line = ($out -split "`r?`n" | Where-Object { $_ -match 'CMake Error|error' } | Select-Object -First 2) -join ' | '
+            Write-Host "::error title=configure failed::$line"
+            exit 1
+          }
+
+      - name: 构建
+        shell: pwsh
+        working-directory: h2mech
+        run: |
+          $out  = cmake --build build --parallel 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          if ($code -ne 0) {
+            $line = ($out -split "`r?`n" | Where-Object { $_ -match 'error C|error LNK|warning C' } | Select-Object -First 3) -join ' | '
+            Write-Host "::error title=build failed::$line"
+            exit 1
+          }
+
+      - name: 测试
+        shell: pwsh
+        working-directory: h2mech
+        run: |
+          $exe = ".\build\bin\h2mech_ut.exe"
+          if (-not (Test-Path $exe)) { Write-Host "::error::找不到 $exe"; exit 1 }
+          & $exe
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::单测失败"; exit 1 }
+
+  # ---------------------------------------------------------------------------
+  # 质量门禁：第三方头边界（公共头零依赖）+ 禁止 C++20 构造
+  # ---------------------------------------------------------------------------
+  quality:
+    name: 质量检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查对外头文件不引第三方头
+        run: |
+          # 装出去的包不该把 asio / openssl / nghttp2 的头塞给使用者。
+          if grep -rnE '^[[:space:]]*#[[:space:]]*include[[:space:]]*<(asio|asio\.hpp|openssl|nghttp2)/' \
+               include/ --include='*.hpp'; then
+            echo "❌ 对外头文件引了第三方头（asio / openssl / nghttp2）"
+            exit 1
+          fi
+          echo "✅ 对外头文件零第三方依赖"
+
+      - name: 检查禁止的 C++20 构造
+        run: |
+          FAIL=0
+          for pat in 'co_await' 'co_return' 'std::span' 'std::format' \
+                     'std::jthread' 'std::atomic_ref' '\bconcept\b' '<=>'; do
+            hits=$(grep -rEn "$pat" include/ src/ test/ \
+                     --include='*.hpp' --include='*.cpp' 2>/dev/null \
+                   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' || true)
+            if [ -n "$hits" ]; then
+              echo "❌ 发现禁止的构造: $pat"
+              echo "$hits"
+              FAIL=1
+            fi
+          done
+          [ $FAIL -eq 0 ] || exit 1
+          echo "✅ 未发现 C++20 构造"

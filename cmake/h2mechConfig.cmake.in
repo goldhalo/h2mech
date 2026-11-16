@@ -1,0 +1,11 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+# h2mech 的公共接口依赖 netmech（TCP/TLS/ALPN 都在它那里）。
+# 使用者需要先能 find_package(netmech)，或把 netmech 一起 add_subdirectory。
+find_dependency(netmech)
+
+include("${CMAKE_CURRENT_LIST_DIR}/h2mechTargets.cmake")
+
+check_required_components(h2mech)
