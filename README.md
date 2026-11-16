@@ -27,8 +27,8 @@
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | S0 | 仓库骨架 + 错误码 + 最小 CI | ✅ 完成 |
-| S1 | h2 语义转换层（伪头/逐跳头/path/authority/content-length，纯函数） | ⏳ 下一步 |
-| S2 | h2c 服务端单流闭环（preface 校验 + nghttp2 驱动 + 读写泵） | ⏳ |
+| S1 | h2 语义转换层（`h2/headers.hpp`：伪头/逐跳头/path/authority/content-length） | ✅ 完成 |
+| S2 | h2c 服务端单流闭环（preface 校验 + nghttp2 驱动 + 读写泵） | ⏳ 下一步 |
 | S3 | 多流与生命周期（流表、RST/GOAWAY/SETTINGS、块池、反压） | ⏳ |
 | S4 | TLS + ALPN（`{"h2","http/1.1"}`，自签 + 指纹 pin） | ⏳ |
 | S5 | gRPC wire 客户端（帧、`grpc-status`、deadline） | ⏳ |
@@ -53,9 +53,18 @@ cmake -S . -B build -G Ninja -DNETMECH_TLS=ON -DOPENSSL_ROOT_DIR=<OpenSSL 前缀
 ## 目录
 
 ```
-include/h2mech/     公共头（common.hpp 错误码 / export.hpp / 伞头）
-src/                实现
-test/               自带极简框架的单元测试
+include/h2mech/
+  common.hpp        错误码（库 / RFC 9113 §7 / gRPC 三段）
+  h2/headers.hpp    h1 ⇄ h2 头字段语义转换（纯函数，可单测）
+src/h2/headers.cpp  上述规则的实现
+test/               自带极简框架（H2MECH_TEST 自动注册）
 thirdparty/         nghttp2 源码（S2 引入）
 adapter/httpmech/   可选：h2 请求 → httpmech::HttpRequest（默认不编）
+```
+
+测试按主题分文件，用例用 `H2MECH_TEST(name) { ... }` 自动注册：
+
+```bash
+./build/bin/h2mech_ut              # 全部
+./build/bin/h2mech_ut headers      # 只跑名字含 headers 的
 ```
