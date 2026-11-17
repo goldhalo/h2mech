@@ -1,0 +1,775 @@
+// =============================================================================
+//  h2mech - HTTP/2 服务端（S2：h2c 单流闭环）
+// =============================================================================
+//  本文件把 nghttp2 的状态机接在 netmech 的 Conn 上。三段式：
+//      读：Conn::read → nghttp2_session_mem_recv → 回调里攒请求 → Handler
+//      写：Handler 交回响应 → nghttp2_session_mem_send → Conn::write
+//      关：Conn 关闭 / 协议错误 → nghttp2_session_del
+//
+//  ★ 两条铁律（踩过才知道）
+//    1. `nghttp2_session_mem_send` 返回的指针**只在下次调用前有效** —— 必须
+//       拷一份再交给 Conn::write（我们拷进 shared_ptr<std::string>，顺便当
+//       ConstBuf 的 owner）。
+//    2. `Conn::write` 是非阻塞 FIFO，返回 false = 这次**没受理**（队列满），
+//       必须自己留着下次再发，不能原地重试打转。
+// =============================================================================
+#include "h2mech/h2/server.hpp"
+
+#if defined(H2MECH_HAS_NGHTTP2)
+
+#include "h2mech/common.hpp"
+
+#include <netmech/conn.hpp>
+#include <netmech/iohandler.hpp>
+#include <netmech/linkable.hpp>
+#include <netmech/mechanism.hpp>
+#include <netmech/tls.hpp>
+
+#include <nghttp2/nghttp2.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace h2mech {
+namespace h2 {
+namespace {
+
+constexpr std::size_t kReadChunk      = 16 * 1024;
+constexpr std::size_t kMaxResponseBody = 16u << 20;
+
+std::string_view sv(const uint8_t* p, std::size_t n)
+{
+    return std::string_view{reinterpret_cast<const char*>(p), n};
+}
+
+int dbg_frame_probe(nghttp2_session*, const nghttp2_frame* f, void*)
+{
+    std::fprintf(stderr, "[dbg] FREE frame type=%u\n", static_cast<unsigned>(f->hd.type));
+    return 0;
+}
+
+// =============================================================================
+//  单条流的状态
+// =============================================================================
+struct StreamState {
+    Request     req;
+    HeaderList  raw_headers;      ///< nghttp2 给的原始头（含伪头）
+    bool        headers_done = false;
+    bool        end_stream   = false;
+    bool        dispatched   = false;
+    bool        responded    = false;
+    bool        body_overflow = false;
+
+    // 响应（整包模型：finish() 时一次性提交）
+    int         status = 0;
+    HeaderList  resp_headers;
+    HeaderList  trailers;
+    std::string resp_body;
+    std::size_t resp_offset = 0;
+};
+
+// =============================================================================
+//  Session：一条连接
+// =============================================================================
+class Session final : public netmech::ConnHandler,
+                      public std::enable_shared_from_this<Session> {
+public:
+    Session(std::shared_ptr<Handler> handler, Server::Config cfg)
+        : handler_(std::move(handler)), cfg_(std::move(cfg))
+    {
+    }
+
+    ~Session() override
+    {
+        if (sess_ != nullptr) {
+            nghttp2_session_del(sess_);
+            sess_ = nullptr;
+        }
+        if (cbs_ != nullptr) {
+            nghttp2_session_callbacks_del(cbs_);
+            cbs_ = nullptr;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    //  ConnHandler
+    // -------------------------------------------------------------------------
+
+    bool on_open(std::shared_ptr<netmech::Conn> ep) override
+    {
+        std::fprintf(stderr, "[dbg] session on_open\n");
+        conn_ = std::move(ep);
+        if (!conn_) {
+            return false;
+        }
+        conn_->set_send_queue_limit(cfg_.max_body_bytes * 2, 256);
+
+        if (!init_session()) {
+            return false;
+        }
+
+        // 起第一笔读（TCP 的 FIN 只在下一次 read 时才被感知）
+        return do_read();
+    }
+
+    void on_read(std::error_code ec, netmech::Buf /*buf*/, std::size_t n) override
+    {
+        if (ec) {
+            return;   // 连接即将关闭，on_close 里收尾
+        }
+        if (n == 0) {
+            do_read();
+            return;
+        }
+
+        std::fprintf(stderr, "[dbg] read n=%zu\n", n);
+        for (std::size_t i = 0; i < n && i < 64; ++i) {
+            std::fprintf(stderr, "%02x%s", rx_[i], ((i % 16) == 15) ? "\n" : " ");
+        }
+        std::fprintf(stderr, "\n");
+        const ssize_t rv = nghttp2_session_mem_recv(
+            sess_, rx_.data(), static_cast<std::size_t>(n));
+        std::fprintf(stderr, "[dbg] mem_recv rv=%ld sess=%p remote_max_streams=%u\n",
+                     static_cast<long>(rv), static_cast<void*>(sess_),
+                     nghttp2_session_get_remote_settings(
+                         sess_, NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS));
+        if (rv < 0) {
+            // ★ 客户端的连接前言（magic）不对也会走到这里：nghttp2 会返回
+            //   NGHTTP2_ERR_BAD_CLIENT_MAGIC —— 所以 h2c 不需要我们手工比对
+            //   preface，交给它校验更准（错误码也更细）。
+            fail_protocol(rv);
+            return;
+        }
+
+        if (nghttp2_session_want_read(sess_) == 0 && nghttp2_session_want_write(sess_) == 0) {
+            close_conn();
+            return;
+        }
+
+        flush();
+        do_read();
+    }
+
+    void on_write(std::error_code ec, netmech::ConstBuf /*buf*/, std::size_t /*n*/) override
+    {
+        if (ec) {
+            return;
+        }
+        // 上一批可能因为队列满而剩下几段：继续泵
+        flush();
+    }
+
+    void on_close() override
+    {
+        // ★ 必须在这里断开对 Conn 的强引用：否则 Conn::Impl 与本 handler 互持成环
+        conn_.reset();
+        streams_.clear();
+        pending_out_.clear();
+        if (handler_) {
+            handler_->on_close();
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    //  Responder 的落点
+    // -------------------------------------------------------------------------
+
+    bool resp_send_headers(std::int32_t id, int status, const HeaderList& headers)
+    {
+        StreamState* st = find(id);
+        if (st == nullptr || st->responded) {
+            return false;
+        }
+        st->status       = status;
+        st->resp_headers = headers;
+        return true;
+    }
+
+    bool resp_send_data(std::int32_t id, std::string_view data)
+    {
+        StreamState* st = find(id);
+        if (st == nullptr || st->responded) {
+            return false;
+        }
+        if (st->resp_body.size() + data.size() > kMaxResponseBody) {
+            return false;
+        }
+        st->resp_body.append(data.data(), data.size());   // 必须拷贝：调用方的内存随时可能失效
+        return true;
+    }
+
+    bool resp_finish(std::int32_t id, const HeaderList& trailers)
+    {
+        StreamState* st = find(id);
+        if (st == nullptr || st->responded) {
+            return false;
+        }
+        st->trailers  = trailers;
+        st->responded = true;
+
+        const HeaderList nv = build_response_headers(
+            ResponseHead{st->status, st->resp_headers}, st->resp_body.size(), true);
+
+        std::vector<nghttp2_nv> raw;
+        raw.reserve(nv.size());
+        for (const Header& h : nv) {
+            raw.push_back(make_nv(h.name, h.value));
+        }
+
+        nghttp2_data_provider provider{};
+        provider.source.ptr = st;
+        provider.read_callback = &Session::data_read_cb;
+
+        const int rv = nghttp2_submit_response(sess_, id, raw.data(), raw.size(), &provider);
+        if (rv != 0) {
+            fail_protocol(static_cast<ssize_t>(rv));
+            return false;
+        }
+        flush();
+        return true;
+    }
+
+    bool resp_abort(std::int32_t id, Errc code)
+    {
+        StreamState* st = find(id);
+        if (st == nullptr) {
+            return false;
+        }
+        st->responded = true;
+        nghttp2_submit_rst_stream(sess_, NGHTTP2_FLAG_NONE, id, to_nghttp2_error(code));
+        flush();
+        return true;
+    }
+
+    void flush_now() { flush(); }
+
+private:
+    // -------------------------------------------------------------------------
+    //  nghttp2 初始化与回调
+    // -------------------------------------------------------------------------
+
+    bool init_session()
+    {
+        nghttp2_session_callbacks* cbs = nullptr;
+        if (nghttp2_session_callbacks_new(&cbs) != 0) {
+            return false;
+        }
+        nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, &dbg_frame_probe);
+        // TEMP-DEBUG：其余四个先不注册
+        // nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, &Session::on_begin_headers_cb);
+        // nghttp2_session_callbacks_set_on_header_callback(cbs, &Session::on_header_cb);
+        // nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, &Session::on_data_chunk_cb);
+        // nghttp2_session_callbacks_set_on_stream_close_callback(cbs, &Session::on_stream_close_cb);
+
+        const int rv = nghttp2_session_server_new(&sess_, cbs, this);
+        std::fprintf(stderr, "[dbg] server_new rv=%d sess=%p\n", rv, static_cast<void*>(sess_));
+        // ★ callbacks 对象**必须活到 session 销毁之后**。
+        //   nghttp2 内部做的是 `session->callbacks = *callbacks`（浅拷贝），
+        //   立刻 del 掉这块内存后，后续任何堆分配都可能把它复用/清零 ——
+        //   表现就是"帧解析正常（远端 SETTINGS 都生效了）但回调一个都不触发"，
+        //   而且这种错误极小规模的用例里可能侥幸不复现（实测踩过）。
+        cbs_ = cbs;
+        std::fprintf(stderr, "[dbg] want_read=%d\n", nghttp2_session_want_read(sess_));
+        if (rv != 0) {
+            sess_ = nullptr;
+            return false;
+        }
+
+        // 通告并发流上限（对端据此决定开多少流）
+        std::array<nghttp2_settings_entry, 1> iv{{
+            {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, cfg_.max_concurrent_streams},
+        }};
+        if (nghttp2_submit_settings(sess_, NGHTTP2_FLAG_NONE, iv.data(), iv.size()) != 0) {
+            return false;
+        }
+        flush();
+        return true;
+    }
+
+    static nghttp2_nv make_nv(const std::string& name, const std::string& value)
+    {
+        nghttp2_nv nv{};
+        nv.name     = reinterpret_cast<uint8_t*>(const_cast<char*>(name.data()));
+        nv.value    = reinterpret_cast<uint8_t*>(const_cast<char*>(value.data()));
+        nv.namelen  = name.size();
+        nv.valuelen = value.size();
+        nv.flags    = NGHTTP2_NV_FLAG_NONE;   // 让 nghttp2 复制，我们不必背生命周期
+        return nv;
+    }
+
+    static int on_begin_headers_cb(nghttp2_session* /*s*/, const nghttp2_frame* frame, void* ud)
+    {
+        auto* self = static_cast<Session*>(ud);
+        std::fprintf(stderr, "[dbg] begin_headers type=%u\n",
+                     static_cast<unsigned>(frame->hd.type));
+        if (frame->hd.type != NGHTTP2_HEADERS) {
+            return 0;   // 目前只关心 HEADERS
+        }
+        if (frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
+            StreamState st;
+            self->streams_.emplace(frame->hd.stream_id, std::move(st));
+        }
+        return 0;
+    }
+
+    static int on_header_cb(nghttp2_session* /*s*/, const nghttp2_frame* frame,
+                            const uint8_t* name, std::size_t namelen,
+                            const uint8_t* value, std::size_t valuelen,
+                            uint8_t /*flags*/, void* ud)
+    {
+        auto* self = static_cast<Session*>(ud);
+        StreamState* st = self->find(frame->hd.stream_id);
+        if (st == nullptr) {
+            return 0;
+        }
+        if (st->raw_headers.size() >= self->cfg_.max_headers) {
+            st->body_overflow = true;   // 复用这个旗标表示"头太多"
+            return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+        }
+        st->raw_headers.push_back(Header{std::string(sv(name, namelen)),
+                                        std::string(sv(value, valuelen))});
+        return 0;
+    }
+
+    static int on_data_chunk_cb(nghttp2_session* /*s*/, uint8_t /*flags*/, std::int32_t id,
+                                const uint8_t* data, std::size_t len, void* ud)
+    {
+        auto* self = static_cast<Session*>(ud);
+        StreamState* st = self->find(id);
+        if (st == nullptr) {
+            return 0;
+        }
+        if (st->req.body.size() + len > self->cfg_.max_body_bytes) {
+            st->body_overflow = true;
+            return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+        }
+        st->req.body.append(reinterpret_cast<const char*>(data), len);   // 拷贝：回调期外失效
+        return 0;
+    }
+
+    static int on_frame_recv_cb(nghttp2_session* /*s*/, const nghttp2_frame* frame, void* ud)
+    {
+        auto* self = static_cast<Session*>(ud);
+        std::fprintf(stderr, "[dbg] frame type=%u flags=0x%x sid=%d\n",
+                     static_cast<unsigned>(frame->hd.type),
+                     static_cast<unsigned>(frame->hd.flags), frame->hd.stream_id);
+        if (frame->hd.type == NGHTTP2_HEADERS) {
+            std::fprintf(stderr, "[dbg]   cat=%d\n", static_cast<int>(frame->headers.cat));
+        }
+
+        if (frame->hd.type == NGHTTP2_HEADERS && frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
+            StreamState* st = self->find(frame->hd.stream_id);
+            if (st != nullptr) {
+                st->headers_done = true;
+                if ((frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0) {
+                    st->end_stream = true;
+                }
+            }
+        } else if (frame->hd.type == NGHTTP2_DATA) {
+            StreamState* st = self->find(frame->hd.stream_id);
+            if (st != nullptr && (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0) {
+                st->end_stream = true;
+            }
+        }
+
+        if ((frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0
+            && (frame->hd.type == NGHTTP2_HEADERS || frame->hd.type == NGHTTP2_DATA)) {
+            self->maybe_dispatch(frame->hd.stream_id);
+        }
+        return 0;
+    }
+
+    static int on_stream_close_cb(nghttp2_session* /*s*/, std::int32_t id, uint32_t /*ec*/,
+                                  void* ud)
+    {
+        auto* self = static_cast<Session*>(ud);
+        self->streams_.erase(id);
+        return 0;
+    }
+
+    static ssize_t data_read_cb(nghttp2_session* s, std::int32_t id, uint8_t* buf,
+                                std::size_t length, uint32_t* flags,
+                                nghttp2_data_source* source, void* /*ud*/)
+    {
+        auto* st = static_cast<StreamState*>(source->ptr);
+        if (st == nullptr) {
+            return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+        }
+
+        const std::size_t left = st->resp_body.size() - st->resp_offset;
+        if (left > 0) {
+            const std::size_t n = std::min(left, length);
+            std::memcpy(buf, st->resp_body.data() + st->resp_offset, n);
+            st->resp_offset += n;
+            if (st->resp_offset < st->resp_body.size()) {
+                return static_cast<ssize_t>(n);
+            }
+            *flags |= NGHTTP2_DATA_FLAG_EOF;
+            if (!st->trailers.empty()) {
+                // 有 trailers：DATA 不带 END_STREAM，随后单独发 HEADERS(END_STREAM)
+                *flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
+                submit_trailers(s, id, st->trailers);
+            }
+            return static_cast<ssize_t>(n);
+        }
+
+        *flags |= NGHTTP2_DATA_FLAG_EOF;
+        if (!st->trailers.empty()) {
+            *flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
+            submit_trailers(s, id, st->trailers);
+        }
+        return 0;
+    }
+
+    static void submit_trailers(nghttp2_session* s, std::int32_t id, const HeaderList& trailers)
+    {
+        std::vector<nghttp2_nv> raw;
+        raw.reserve(trailers.size());
+        for (const Header& h : trailers) {
+            raw.push_back(make_nv(h.name, h.value));
+        }
+        nghttp2_submit_trailer(s, id, raw.data(), raw.size());
+    }
+
+    // -------------------------------------------------------------------------
+    //  分发与收尾
+    // -------------------------------------------------------------------------
+
+    void maybe_dispatch(std::int32_t id)
+    {
+        StreamState* st = find(id);
+        if (st == nullptr || !st->headers_done || !st->end_stream || st->dispatched) {
+            return;
+        }
+        st->dispatched = true;
+        std::fprintf(stderr, "[dbg] dispatch sid=%d\n", id);
+
+        if (st->body_overflow) {
+            abort_stream(id, Errc::enhance_your_calm);
+            return;
+        }
+
+        RequestHeadResult parsed = build_request_head(st->raw_headers, cfg_.max_headers);
+        if (!parsed.ok()) {
+            abort_stream(id, map_headers_status(parsed.status));
+            return;
+        }
+
+        st->req.method    = std::move(parsed.head.method);
+        st->req.url       = std::move(parsed.head.url);
+        st->req.query     = std::move(parsed.head.query);
+        st->req.authority = std::move(parsed.head.authority);
+        st->req.scheme    = std::move(parsed.head.scheme);
+        st->req.headers   = std::move(parsed.head.headers);
+
+        if (!handler_) {
+            abort_stream(id, Errc::internal_error);
+            return;
+        }
+
+        Responder out{id, this};
+        handler_->on_request(st->req, out);
+
+        // 业务忘了收尾：兜底结束，避免流一直挂着（与 httpmech 的 500 兜底同思路）
+        if (!st->responded) {
+            StreamState* again = find(id);
+            if (again != nullptr) {
+                again->status       = 500;
+                again->resp_headers = HeaderList{{"content-type", "text/plain"}};
+                again->resp_body    = "handler did not respond";
+                resp_finish(id, HeaderList{});
+            }
+        }
+    }
+
+    void abort_stream(std::int32_t id, Errc code)
+    {
+        StreamState* st = find(id);
+        if (st != nullptr) {
+            st->responded = true;
+        }
+        nghttp2_submit_rst_stream(sess_, NGHTTP2_FLAG_NONE, id, to_nghttp2_error(code));
+        flush();
+    }
+
+    static Errc map_headers_status(HeadersStatus s) noexcept
+    {
+        switch (s) {
+        case HeadersStatus::ok:
+            return Errc::internal_error;
+        case HeadersStatus::too_many_headers:
+            return Errc::enhance_your_calm;
+        default:
+            return Errc::protocol_error;
+        }
+    }
+
+    static uint32_t to_nghttp2_error(Errc e) noexcept
+    {
+        switch (e) {
+        case Errc::protocol_error:          return NGHTTP2_PROTOCOL_ERROR;
+        case Errc::internal_error:          return NGHTTP2_INTERNAL_ERROR;
+        case Errc::flow_control_error:      return NGHTTP2_FLOW_CONTROL_ERROR;
+        case Errc::stream_closed:           return NGHTTP2_STREAM_CLOSED;
+        case Errc::frame_size_error:        return NGHTTP2_FRAME_SIZE_ERROR;
+        case Errc::refused_stream:          return NGHTTP2_REFUSED_STREAM;
+        case Errc::cancel:                  return NGHTTP2_CANCEL;
+        case Errc::compression_error:       return NGHTTP2_COMPRESSION_ERROR;
+        case Errc::connect_error:           return NGHTTP2_CONNECT_ERROR;
+        case Errc::enhance_your_calm:       return NGHTTP2_ENHANCE_YOUR_CALM;
+        case Errc::inadequate_security:     return NGHTTP2_INADEQUATE_SECURITY;
+        case Errc::http_1_1_required:       return NGHTTP2_HTTP_1_1_REQUIRED;
+        default:                            return NGHTTP2_INTERNAL_ERROR;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    //  读写泵
+    // -------------------------------------------------------------------------
+
+    /// 把 nghttp2 里待发的字节全部搬给 Conn（队列满就留着，等 on_write 续泵）。
+    void flush()
+    {
+        if (sess_ == nullptr || !conn_) {
+            return;
+        }
+        // 先把上一轮没发出去的吐干净
+        while (!pending_out_.empty()) {
+            const auto& sp = pending_out_.front();
+            if (!conn_->write(netmech::ConstBuf{sp, sp->data(), sp->size()})) {
+                return;   // 队列满：留着，等 on_write
+            }
+            pending_out_.pop_front();
+        }
+
+        for (;;) {
+            const uint8_t* data = nullptr;
+            const ssize_t  n    = nghttp2_session_mem_send(sess_, &data);
+            if (n <= 0) {
+                break;
+            }
+            // ★ 必须拷贝：data 的指针只在下次 mem_send 之前有效
+            auto sp = std::make_shared<std::string>(reinterpret_cast<const char*>(data),
+                                                    static_cast<std::size_t>(n));
+            if (!conn_->write(netmech::ConstBuf{sp, sp->data(), sp->size()})) {
+                pending_out_.push_back(std::move(sp));
+                return;
+            }
+        }
+    }
+
+    bool do_read()
+    {
+        if (!conn_) {
+            return false;
+        }
+        return conn_->read(netmech::Buf{nullptr, rx_.data(), rx_.size()});
+    }
+
+    void fail_protocol(ssize_t rv)
+    {
+        if (handler_) {
+            handler_->on_protocol_error(make_error_code(Errc::protocol_error));
+        }
+        (void)rv;
+        close_conn();
+    }
+
+    void close_conn()
+    {
+        if (conn_) {
+            conn_->close();
+        }
+    }
+
+    StreamState* find(std::int32_t id)
+    {
+        auto it = streams_.find(id);
+        return it == streams_.end() ? nullptr : &it->second;
+    }
+
+    std::shared_ptr<Handler>   handler_;
+    Server::Config             cfg_;
+    std::shared_ptr<netmech::Conn> conn_;
+    nghttp2_session*           sess_ = nullptr;
+    nghttp2_session_callbacks* cbs_  = nullptr;   ///< 必须活到 session 之后（见 init_session）
+
+    std::array<uint8_t, kReadChunk>                   rx_{};
+    std::unordered_map<std::int32_t, StreamState>     streams_;
+    std::deque<std::shared_ptr<std::string>>          pending_out_;
+};
+
+} // namespace
+
+// =============================================================================
+//  Responder → Session
+// =============================================================================
+bool Responder::send_headers(int status, const HeaderList& headers)
+{
+    return static_cast<Session*>(state_)->resp_send_headers(stream_id_, status, headers);
+}
+
+bool Responder::send_data(std::string_view data)
+{
+    return static_cast<Session*>(state_)->resp_send_data(stream_id_, data);
+}
+
+bool Responder::finish(const HeaderList& trailers)
+{
+    return static_cast<Session*>(state_)->resp_finish(stream_id_, trailers);
+}
+
+bool Responder::abort(Errc code)
+{
+    return static_cast<Session*>(state_)->resp_abort(stream_id_, code);
+}
+
+// =============================================================================
+//  Server
+// =============================================================================
+namespace {
+
+class ServerLinkable final : public netmech::Linkable {
+public:
+    explicit ServerLinkable(std::weak_ptr<Server::Impl> impl) : impl_(std::move(impl)) {}
+
+    std::shared_ptr<netmech::ConnHandler> on_accept(netmech::Conn& c) override;
+
+    void on_accept_failed(const netmech::Address&, std::error_code) override {}
+
+private:
+    std::weak_ptr<Server::Impl> impl_;
+};
+
+} // namespace
+
+struct Server::Impl : public std::enable_shared_from_this<Server::Impl> {
+    std::shared_ptr<netmech::Mechanism> mech;
+    Config                              cfg;
+    std::shared_ptr<Handler>            handler;
+    std::shared_ptr<ServerLinkable>     linkable;
+    std::atomic<bool>                   running{false};
+    netmech::Address                    bound{};
+    mutable std::mutex                  mu;
+    std::vector<std::weak_ptr<netmech::ConnHandler>> sessions;
+};
+
+std::shared_ptr<netmech::ConnHandler> ServerLinkable::on_accept(netmech::Conn& c)
+{
+    auto impl = impl_.lock();
+    if (!impl || !impl->running.load()) {
+        return nullptr;
+    }
+
+    // TLS 场景：ALPN 必须协商出 h2（否则对端会按 h1 说话，这里没有解析器）
+    if (impl->cfg.tls && c.alpn_protocol() != "h2") {
+        c.close();
+        return nullptr;
+    }
+
+    auto session = std::make_shared<Session>(impl->handler, impl->cfg);
+    {
+        std::lock_guard<std::mutex> lk(impl->mu);
+        impl->sessions.push_back(session);
+    }
+    return session;
+}
+
+Server::Server() : m_impl(std::make_shared<Impl>()) {}
+
+Server::~Server() = default;
+
+std::shared_ptr<Server> Server::create(Config cfg, std::shared_ptr<Handler> handler,
+                                       std::shared_ptr<netmech::Runtime> runtime)
+{
+    if (!handler) {
+        return nullptr;
+    }
+    auto mech = netmech::Mechanism::create(netmech::Mechanism::Config{}, std::move(runtime));
+    if (!mech) {
+        return nullptr;
+    }
+    return create(std::move(mech), std::move(cfg), std::move(handler));
+}
+
+std::shared_ptr<Server> Server::create(std::shared_ptr<netmech::Mechanism> mech,
+                                       Config cfg, std::shared_ptr<Handler> handler)
+{
+    if (!mech || !handler) {
+        return nullptr;
+    }
+    auto srv      = std::shared_ptr<Server>(new Server());
+    srv->m_impl->mech    = std::move(mech);
+    srv->m_impl->cfg     = std::move(cfg);
+    srv->m_impl->handler = std::move(handler);
+    return srv;
+}
+
+std::error_code Server::start()
+{
+    if (m_impl->running.load()) {
+        return make_error_code(Errc::already_started);
+    }
+
+    m_impl->linkable = std::make_shared<ServerLinkable>(m_impl);
+    m_impl->running.store(true);
+
+    netmech::ListenOptions opts;
+    opts.backlog = m_impl->cfg.backlog;
+    if (m_impl->cfg.tls) {
+        netmech::TlsConfig tls = *m_impl->cfg.tls;
+        tls.alpn               = {"h2"};   // h2 over TLS：只接受 h2
+        opts.tls               = std::move(tls);
+    }
+
+    const auto ec = m_impl->mech->listen(m_impl->cfg.local, m_impl->linkable, opts);
+    if (ec) {
+        m_impl->running.store(false);
+        m_impl->linkable.reset();
+        return ec;
+    }
+
+    if (auto actual = m_impl->mech->listening_address(m_impl->cfg.local)) {
+        m_impl->bound = *actual;
+    } else {
+        m_impl->bound = m_impl->cfg.local;
+    }
+    return std::error_code{};
+}
+
+void Server::stop() noexcept
+{
+    if (!m_impl->running.exchange(false)) {
+        return;
+    }
+    if (m_impl->mech) {
+        const netmech::Address addr =
+            (m_impl->bound.port() != 0) ? m_impl->bound : m_impl->cfg.local;
+        m_impl->mech->unlisten(addr);
+    }
+    m_impl->linkable.reset();
+}
+
+netmech::Address Server::local() const
+{
+    return m_impl->bound.port() != 0 ? m_impl->bound : m_impl->cfg.local;
+}
+
+bool Server::running() const noexcept
+{
+    return m_impl->running.load();
+}
+
+} // namespace h2
+} // namespace h2mech
+
+#endif // H2MECH_HAS_NGHTTP2

@@ -28,7 +28,7 @@
 |---|---|---|
 | S0 | 仓库骨架 + 错误码 + 最小 CI | ✅ 完成 |
 | S1 | h2 语义转换层（`h2/headers.hpp`：伪头/逐跳头/path/authority/content-length） | ✅ 完成 |
-| S2 | h2c 服务端单流闭环（preface 校验 + nghttp2 驱动 + 读写泵） | ⏳ 下一步 |
+| S2 | h2c 服务端单流闭环（preface 校验 + nghttp2 驱动 + 读写泵） | 🔬 进行中：vendored nghttp2 已就位；会话层卡在一个回调不触发的接入问题，代码暂存 `experiments/h2-session-wip/`（详见该目录 README） |
 | S3 | 多流与生命周期（流表、RST/GOAWAY/SETTINGS、块池、反压） | ⏳ |
 | S4 | TLS + ALPN（`{"h2","http/1.1"}`，自签 + 指纹 pin） | ⏳ |
 | S5 | gRPC wire 客户端（帧、`grpc-status`、deadline） | ⏳ |

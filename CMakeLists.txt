@@ -36,6 +36,7 @@ option(H2MECH_BUILD_TESTS        "构建单元测试" ON)
 option(H2MECH_BUILD_EXAMPLES     "构建示例" OFF)
 option(H2MECH_WARNINGS_AS_ERRORS "把**库与示例**的告警当错误（CI 用；test/ 不受约束）" OFF)
 option(H2MECH_PIC                "编译为位置无关代码（静态库要链进 .so 时必须开）" ON)
+option(H2MECH_WITH_NGHTTP2       "使用仓内 vendored 的 nghttp2（关掉只能编头字段层）" ON)
 
 # ---------------------------------------------------------------------------
 # 2. 定位 netmech（同级目录，或 -DH2MECH_NETMECH_DIR=<路径>）
@@ -82,6 +83,20 @@ target_compile_options(h2mech_compile_options INTERFACE
     $<$<COMPILE_LANGUAGE:CXX>:$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall;-Wextra>>
     $<$<COMPILE_LANGUAGE:C>:$<$<C_COMPILER_ID:MSVC>:/utf-8;/W3>>
     $<$<COMPILE_LANGUAGE:C>:$<$<NOT:$<C_COMPILER_ID:MSVC>>:-Wall;-Wextra>>)
+
+# ---------------------------------------------------------------------------
+# 3.5 nghttp2（vendored，只编 lib/）
+# ---------------------------------------------------------------------------
+#  它只被 src/h2/session.cpp 用到，且**公共头一行都不引**（quality job 守着
+#  这条边界）。关掉 H2MECH_WITH_NGHTTP2 时只能编到"头字段语义转换层"，
+#  会话相关代码由 H2MECH_HAS_NGHTTP2 宏整段排除。
+if(H2MECH_WITH_NGHTTP2)
+    add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/nghttp2"
+                     "${CMAKE_BINARY_DIR}/nghttp2")
+    message(STATUS "h2mech: nghttp2 @ thirdparty/nghttp2（vendored，仅 lib/）")
+else()
+    message(STATUS "h2mech: nghttp2 已关闭（只编头字段语义层）")
+endif()
 
 # ---------------------------------------------------------------------------
 # 4. 主库
@@ -131,6 +146,16 @@ target_link_libraries(h2mech PUBLIC
     $<INSTALL_INTERFACE:netmech::netmech>)
 target_link_libraries(h2mech PUBLIC h2mech_compile_options)
 
+# nghttp2 是**实现细节**：公共头不引它，所以 PRIVATE。
+#
+# 目前（S1 收尾）还没有源文件用到 nghttp2 —— 会话层在 experiments/h2-session-wip
+# 里等一个未解决的接入问题（见该目录 README）。这里**先不链接**，避免给产物
+# 带进一个没人用的 300 KB 静态库；等 S2 落地时把下面三行打开即可。
+# if(H2MECH_WITH_NGHTTP2)
+#     target_compile_definitions(h2mech PRIVATE H2MECH_HAS_NGHTTP2)
+#     target_link_libraries(h2mech PRIVATE nghttp2_static)
+# endif()
+
 if(H2MECH_LIBRARY_TYPE STREQUAL "SHARED")
     target_compile_definitions(h2mech PUBLIC H2MECH_SHARED)
     target_compile_definitions(h2mech PRIVATE H2MECH_BUILDING_LIBRARY)
@@ -165,6 +190,13 @@ if(H2MECH_BUILD_TESTS)
         set_target_properties(h2mech_ut PROPERTIES FOLDER "h2mech/test")
         target_include_directories(h2mech_ut PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/test")
         target_link_libraries(h2mech_ut PRIVATE h2mech)
+
+        # 端到端用例直接 include <nghttp2/nghttp2.h>（用它的 client 模式当对端），
+        # 因此需要 nghttp2 的**使用需求**（头路径 + Windows 的 ssize_t 定义）。
+        # 会话层的端到端用例在 experiments/h2-session-wip（未接入构建）：
+        # 等它修好之后再给测试目标加 nghttp2 的头 + 宏（注意**不要**再
+        # target_link_libraries 一次 nghttp2_static，那会让同一个静态库在
+        # 可执行文件里出现两份符号）。
         add_test(NAME h2mech_ut COMMAND h2mech_ut)
 
         # 统一输出到 bin/：CI 里"失败时直接跑一遍取详细输出"用的是这个路径，
