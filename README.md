@@ -32,7 +32,7 @@
 | S3 | 多流并发与生命周期（并发流隔离、RST、连接级内存配额、写反压） | ✅ 完成（27 用例 / 237 断言） |
 | S4 | h2 over TLS + ALPN（服务端强制 `h2`、非 h2 直接拒） | ✅ 完成（29 用例 / 255 断言，含真握手） |
 | S5 | gRPC wire 层 + unary 客户端（帧、`grpc-status`/trailers、`grpc-timeout`） | ✅ 完成（42 用例 / 783 断言） |
-| S6 | gRPC 服务端（方法注册、trailers、Trailers-Only） | ⏳ 下一步 |
+| S6 | gRPC 服务端（方法注册、trailers、Trailers-Only） | ✅ 完成（48 用例 / 811 断言） |
 | S7 | adapter/httpmech + 同端口 h1/h2c preface 嗅探（可选） | ⏳ |
 
 ## 构建
@@ -87,6 +87,33 @@ cfg.tls   = tls;                       // ← 只加这一行
 通过 `Conn::alpn_protocol()` 断言协商结果是 `h2`，并跑通一条请求回环；
 另一条用例用只谈 `http/1.1` 的客户端，断言服务端直接关闭、handler 不被调用。
 
+## 线程模型与锁（评审时看这一节）
+
+**服务端：一把锁都没有。** netmech 的约定是"一个连接 = 一个 io 线程，回调严格串行"，
+所以：
+
+- `h2::Server` 的每个 `Session` 只被它自己的 io 线程碰：流表、读写泵、
+  nghttp2 会话全都不加锁；
+- `grpc::Server` 的方法表在 `start()` **之前**注册完，之后只读（读不需要锁）；
+- 唯一的跨线程共享是 `h2::Server` 里的"会话弱引用表"（`stop()` 要从调用线程
+  逐个发 GOAWAY），它由一把 `std::mutex` 保护，作用域只有"push_back / 遍历"。
+
+**客户端：两把锁，嵌套顺序固定 `io_mu_ → state_mu_`。**
+
+| 锁 | 保护什么 | 谁拿 |
+|---|---|---|
+| `io_mu_` | nghttp2 会话、发送队列、`Conn` | io 线程（回调）、调用线程（提交请求 / 取消流） |
+| `state_mu_` | 连接标志、本次调用结果、`done` | io 线程（回调里写）、调用线程（等待 / 读结果） |
+
+为什么必须两把：`nghttp2` 的回调是在 `mem_recv`（持 `io_mu_`）内部**同步**调用的，
+回调里要写结果就得再拿 `state_mu_`（io → state）。而调用线程从不在持
+`state_mu_` 时去拿 `io_mu_`（提交/取消都先解锁），所以不会反向嵌套、不会死锁。
+
+**为什么客户端不干脆"全部丢给 io 线程"**：`call()` 要阻塞等结果，就得有一个
+让调用线程等待的同步点（条件变量 + `state_mu_`）；如果连 nghttp2 会话也只让
+io 线程碰，调用线程就必须"投递任务"给 io 线程，而 `Conn` 没有公开的 post 接口
+（也不该为这个加）。两把锁、顺序固定，是目前最省事且可证明不会死锁的写法。
+
 ## gRPC unary 客户端（S5）
 
 ```cpp
@@ -119,6 +146,36 @@ if (r.ok()) {
 wire 层本身（`h2mech/grpc/framer.hpp`）也可单独用：`MessageReader` 是增量解析器，
 5 字节前缀被 TCP 切在任何位置都能拼回来，并对长度前缀设了上限（默认 4 MiB），
 避免对端用一个 `FF FF FF FF` 让我们预分配 4 GiB。
+
+## gRPC 服务端（S6）
+
+```cpp
+#include <h2mech/grpc/server.hpp>
+
+auto service = std::make_shared<h2mech::grpc::Service>();
+service->add_unary("/helloworld.Greeter/SayHello",
+                   [](h2mech::grpc::ServerCall& call, const h2mech::grpc::Frame& req) {
+                       call.send(do_something(req.payload));      // 响应消息字节
+                       call.finish(h2mech::grpc::Status{});       // grpc-status: 0
+                   });
+
+h2mech::grpc::ServerConfig cfg;
+cfg.http.local = {"0.0.0.0", 50051};
+cfg.http.tls   = tls;            // 要 TLS 就配（ALPN 由 h2::Server 固定成 h2）
+
+auto srv = h2mech::grpc::Server::create(cfg, service);
+srv->start();
+```
+
+三条语义：
+
+1. **Trailers-Only**：处理函数**没有** `send()` 就 `finish(错误状态)` 时，`grpc-status`
+   直接进响应头（HEADERS 带 END_STREAM），不发 DATA、也不单发 trailers ——
+   这是规范要求的错误答复形态，写成"空 DATA + trailers"会让部分客户端报 UNKNOWN。
+2. **未注册的方法**自动回 `UNIMPLEMENTED`；请求不是 POST/`application/grpc` 时
+   回 HTTP 405/415（对端根本不是 gRPC 客户端，给它 grpc-status 只会更困惑）。
+3. **处理函数抛异常**会被捕获并转成 `INTERNAL`；忘记 `finish()` 由框架兜底
+   —— 异常绝不允许穿透到 io 线程（那会 terminate 整个进程）。
 
 ### 一个值得记住的坑：客户端必须**自己**发 SETTINGS
 
