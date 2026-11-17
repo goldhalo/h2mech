@@ -1,5 +1,9 @@
 # h2mech
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://en.cppreference.com/w/cpp/17)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey.svg)](#构建)
+
 **HTTP/2 与 gRPC 的协议层**，基于 [netmech](../netmech) 的 TCP / TLS / ALPN。
 
 与 [httpmech](../httpmech) 的分工：**httpmech 冻结在 HTTP/1.1**（含 HTTPS/WSS），
@@ -217,3 +221,43 @@ nghttp2 的客户端会话只会自动发连接前言里的 magic，**SETTINGS �
 ./build/bin/h2mech_ut              # 全部
 ./build/bin/h2mech_ut headers      # 只跑名字含 headers 的
 ```
+
+## 与开源 gRPC 组件对接（下一步要验的）
+
+本库的目标是**和现成的 gRPC 生态互通**，而不是自成一套。目前的用例是本仓的
+client ↔ server 自闭环，已经把 wire 层的硬性要求覆盖了：
+
+| 规范要求 | 本库状态 |
+|---|---|
+| `content-type: application/grpc`（含 `+proto` 后缀） | ✅ 发/收都校验 |
+| 请求头 `te: trailers` | ✅ 客户端自动加 |
+| 5 字节消息前缀（压缩位 + 大端长度） | ✅ 增量解析，长度有上限 |
+| 响应以 **trailers** 的 `grpc-status` 结束 | ✅ |
+| **Trailers-Only**（无正文时 status 进响应头） | ✅ 服务端按此形态回错误 |
+| `grpc-timeout` | ✅ 生成 + 透传给业务 |
+| `:method` = POST、`:scheme` = http/https | ✅ |
+
+**还没验证、但下一步要跑的**（用现成工具，不自己造客户端）：
+
+```bash
+# 1) grpcurl 打 h2c 服务端（用 protoset 就不必现编 proto）
+grpcurl -plaintext -protoset my.protoset localhost:50051 helloworld.Greeter/SayHello
+
+# 2) grpcurl 打 h2 over TLS（自签证书）
+grpcurl -insecure -protoset my.protoset localhost:8443 helloworld.Greeter/SayHello
+
+# 3) 用 grpc-go 的 helloworld 客户端调本库服务端（验 metadata / trailers 细节）
+# 4) 用本库 grpc::Client 调 grpc-go 的 helloworld 服务端（验服务端实现是否规范）
+```
+
+**已知的简化**（对接时可能被这几个卡到，先列出来）：
+
+1. **压缩**：`compressed = 1` 只**透传标记**，不解压 —— 对端真发 gzip 消息时要由业务解；
+2. **`grpc-message` 的 %-encoding**：中文错误文案目前原样透传，规范要求转义；
+3. **streaming**：服务端 `ServerCall::send()` 可以多次发（帧层是通的），但
+   **客户端只实现了 unary**（只取第一条消息），双向流还没做；
+4. **不做 protobuf**：请求/响应都是已序列化的字节，proto 由应用侧 protoc 生成。
+
+## License
+
+MIT，见 [LICENSE](LICENSE)。
