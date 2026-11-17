@@ -31,8 +31,8 @@
 | S2 | h2c 服务端闭环（nghttp2 驱动 + 读写泵 + 正文回环 + trailers + stop 关连接） | ✅ 完成（24 用例 / 177 断言，gcc+clang+MSVC，零告警） |
 | S3 | 多流并发与生命周期（并发流隔离、RST、连接级内存配额、写反压） | ✅ 完成（27 用例 / 237 断言） |
 | S4 | h2 over TLS + ALPN（服务端强制 `h2`、非 h2 直接拒） | ✅ 完成（29 用例 / 255 断言，含真握手） |
-| S5 | gRPC wire 客户端（帧、`grpc-status`、deadline） | ⏳ 下一步 |
-| S6 | gRPC 服务端（方法注册、trailers、Trailers-Only） | ⏳ |
+| S5 | gRPC wire 层 + unary 客户端（帧、`grpc-status`/trailers、`grpc-timeout`） | ✅ 完成（42 用例 / 783 断言） |
+| S6 | gRPC 服务端（方法注册、trailers、Trailers-Only） | ⏳ 下一步 |
 | S7 | adapter/httpmech + 同端口 h1/h2c preface 嗅探（可选） | ⏳ |
 
 ## 构建
@@ -86,6 +86,39 @@ cfg.tls   = tls;                       // ← 只加这一行
 `test/test_h2_tls.cpp` 里就是**真握手**：内嵌的自签证书 + 指纹 pin，
 通过 `Conn::alpn_protocol()` 断言协商结果是 `h2`，并跑通一条请求回环；
 另一条用例用只谈 `http/1.1` 的客户端，断言服务端直接关闭、handler 不被调用。
+
+## gRPC unary 客户端（S5）
+
+```cpp
+#include <h2mech/grpc/client.hpp>
+
+h2mech::grpc::ClientConfig cfg;
+cfg.remote = {"10.0.0.5", 50051};
+// cfg.tls = tls;                 // 需要 TLS 就配上（ALPN 自动固定为 h2）
+
+auto cli = h2mech::grpc::Client::create(cfg);
+
+// 请求/响应都是**已序列化**的字节：proto 由应用侧 protoc 生成，库不碰
+const auto r = cli->call("/helloworld.Greeter/SayHello", request_bytes);
+if (r.ok()) {
+    /* r.message 是响应消息字节 */
+} else {
+    /* r.status.code / r.status.message 是 gRPC 状态（UNAVAILABLE / NOT_FOUND …） */
+}
+```
+
+三个必须知道的语义：
+
+1. **HTTP 200 ≠ 调用成功**。gRPC 的结果在 trailers 的 `grpc-status` 里；`r.http_status`
+   只是观测值。缺 `grpc-status` 时本库判 `UNKNOWN`（**不**判成功）。
+2. **串行**：一个 `Client` 同时只跑一个调用（设备对平台的链路足够），
+   第二个并发调用立刻返回 `INTERNAL` + 明确说明。
+3. **超时**：`call()` 的 timeout 会同时用于本地等待和发给对端的 `grpc-timeout`
+   （毫秒精度尽量保留，不做"1500ms 变 2s"的取整）。
+
+wire 层本身（`h2mech/grpc/framer.hpp`）也可单独用：`MessageReader` 是增量解析器，
+5 字节前缀被 TCP 切在任何位置都能拼回来，并对长度前缀设了上限（默认 4 MiB），
+避免对端用一个 `FF FF FF FF` 让我们预分配 4 GiB。
 
 ### 一个值得记住的坑：客户端必须**自己**发 SETTINGS
 
