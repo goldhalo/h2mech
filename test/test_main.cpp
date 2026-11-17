@@ -6,6 +6,8 @@
 // =============================================================================
 #include "test_framework.hpp"
 
+#include <netmech/common.hpp>   // netmech::shutdown()
+
 #include <cstdio>
 #include <string>
 
@@ -21,5 +23,13 @@ int main(int argc, char** argv)
             filter = argv[i];   // 裸参数即过滤子串
         }
     }
-    return h2mech_test::run_all(filter);
+    const int rc = h2mech_test::run_all(filter);
+
+    // 退出前停掉 netmech 的进程级 io 池。
+    //
+    // TLS 用例会真建连接、真跑 io 线程；不停的话进程退出时可能还有线程在跑，
+    // 与 OpenSSL 的 atexit 清理相撞 —— 表现为 sanitizer 在 exit() 阶段报一条
+    // libcrypto 的 data race（netmech 仓里踩过同样的问题）。
+    netmech::shutdown();
+    return rc;
 }

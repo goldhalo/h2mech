@@ -74,6 +74,63 @@ jobs:
         run: ./build/bin/h2mech_ut || true
 
   # ---------------------------------------------------------------------------
+  # Linux / TLS：h2 over TLS + ALPN 的门禁
+  #
+  # 为什么单独一个 job：TLS 用例只在 -DNETMECH_TLS=ON 的构建里才有实体
+  # （否则 test_h2_tls.cpp 整段被 #if 排除，只剩一个桩用例）。混进矩阵会让
+  # "到底是哪一半红了"变得含糊，也容易"看着绿、其实一条 TLS 用例都没跑"。
+  # ---------------------------------------------------------------------------
+  linux-tls:
+    name: Linux / gcc / TLS
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: 检出 h2mech
+        uses: actions/checkout@v4
+        with:
+          path: h2mech
+
+      - name: 检出 netmech（依赖）
+        uses: actions/checkout@v4
+        with:
+          repository: goldhalo/netmech
+          path: netmech
+
+      - name: 安装工具（含 OpenSSL 开发包）
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ libssl-dev
+
+      - name: 配置
+        working-directory: h2mech
+        run: |
+          cmake -S . -B build -G Ninja \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DNETMECH_TLS=ON \
+                -DH2MECH_WARNINGS_AS_ERRORS=ON
+
+      - name: 构建
+        working-directory: h2mech
+        run: cmake --build build --parallel
+
+      - name: 测试（TLS 用例必须真的执行）
+        working-directory: h2mech
+        run: |
+          set +e
+          ./build/bin/h2mech_ut 2>&1 | tee /tmp/ut.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            echo "::error title=TLS 单测失败::$(grep -m1 'FAIL' /tmp/ut.log | cut -c1-300)"
+            exit 1
+          fi
+          # 光"没失败"不够：用例被 #if 掉时门禁会假绿。
+          grep -q '\[h2_tls_alpn_negotiates_h2_and_roundtrips\]' /tmp/ut.log || {
+            echo "::error::TLS 用例没有被执行（-DNETMECH_TLS=ON 没生效？）"
+            exit 1
+          }
+          echo "✅ h2 over TLS 用例已执行"
+
+  # ---------------------------------------------------------------------------
   # Windows / MSVC（Ninja + msvc-dev-cmd：VS 生成器的探测在 runner 镜像升级后
   # 反复失效，与其它 mech 仓保持一致）
   # ---------------------------------------------------------------------------

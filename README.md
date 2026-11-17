@@ -30,8 +30,8 @@
 | S1 | h2 语义转换层（`h2/headers.hpp`：伪头/逐跳头/path/authority/content-length） | ✅ 完成 |
 | S2 | h2c 服务端闭环（nghttp2 驱动 + 读写泵 + 正文回环 + trailers + stop 关连接） | ✅ 完成（24 用例 / 177 断言，gcc+clang+MSVC，零告警） |
 | S3 | 多流并发与生命周期（并发流隔离、RST、连接级内存配额、写反压） | ✅ 完成（27 用例 / 237 断言） |
-| S4 | TLS + ALPN（`{"h2","http/1.1"}`，自签 + 指纹 pin） | ⏳ 下一步 |
-| S5 | gRPC wire 客户端（帧、`grpc-status`、deadline） | ⏳ |
+| S4 | h2 over TLS + ALPN（服务端强制 `h2`、非 h2 直接拒） | ✅ 完成（29 用例 / 255 断言，含真握手） |
+| S5 | gRPC wire 客户端（帧、`grpc-status`、deadline） | ⏳ 下一步 |
 | S6 | gRPC 服务端（方法注册、trailers、Trailers-Only） | ⏳ |
 | S7 | adapter/httpmech + 同端口 h1/h2c preface 嗅探（可选） | ⏳ |
 
@@ -63,6 +63,29 @@ test/               自带极简框架（H2MECH_TEST 自动注册）
 thirdparty/         nghttp2 源码（v1.71.0，只编 lib/）
 adapter/httpmech/   可选：h2 请求 → httpmech::HttpRequest（默认不编）
 ```
+
+## h2 over TLS（S4）
+
+TLS 由 netmech 提供，h2mech 只做两件事：把 `alpn` 固定成 `h2`，以及在
+`on_accept` 里拒绝没协商出 `h2` 的连接（否则会把 h1 的字节喂给 h2 状态机）。
+
+```cpp
+#include <netmech/tls.hpp>
+
+auto tls = std::make_shared<netmech::TlsConfig>();
+tls->cert_chain_file  = "server.crt";
+tls->private_key_file = "server.key";
+// 不需要显式配 alpn：Server::start() 会强制成 {"h2"}
+
+h2mech::h2::Server::Config cfg;
+cfg.local = {"0.0.0.0", 8443};
+cfg.tls   = tls;                       // ← 只加这一行
+```
+
+客户端（netmech）：`TlsConfig::pinned_sha256` 或 `ca_file` + `alpn = {"h2"}`。
+`test/test_h2_tls.cpp` 里就是**真握手**：内嵌的自签证书 + 指纹 pin，
+通过 `Conn::alpn_protocol()` 断言协商结果是 `h2`，并跑通一条请求回环；
+另一条用例用只谈 `http/1.1` 的客户端，断言服务端直接关闭、handler 不被调用。
 
 ### 一个值得记住的坑：客户端必须**自己**发 SETTINGS
 
