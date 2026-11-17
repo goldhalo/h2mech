@@ -158,6 +158,21 @@ public:
         flush();
     }
 
+    /// 由 `Server::stop()` 调用：发 GOAWAY 后关闭（尽力而为）。
+    ///
+    /// @note 这里不等待在途流收尾：`stop()` 的契约是"尽快停"，
+    ///       想优雅排空请在业务层先拒绝新请求、等自己的计数归零再 stop()。
+    void shutdown_gracefully()
+    {
+        if (sess_ != nullptr && conn_ && conn_->is_open()) {
+            // last_stream_id = 0：告诉对端"我这边没有已处理完的流"，
+            // 对端据此不会再发新流（已在途的由 RST_STREAM/超时收场）。
+            nghttp2_submit_goaway(sess_, NGHTTP2_FLAG_NONE, 0, NGHTTP2_NO_ERROR, nullptr, 0);
+            flush();
+        }
+        close_conn();
+    }
+
     void on_close() override
     {
         // ★ 必须在这里断开对 Conn 的强引用：否则 Conn::Impl 与本 handler 互持成环
@@ -633,7 +648,9 @@ struct Server::Impl : public std::enable_shared_from_this<Server::Impl> {
     std::atomic<bool>                   running{false};
     netmech::Address                    bound{};
     mutable std::mutex                  mu;
-    std::vector<std::weak_ptr<netmech::ConnHandler>> sessions;
+    /// 已建立的会话（弱引用：连接的生死由 netmech 决定）。
+    /// stop() 用它给每条连接发 GOAWAY 并关闭，否则 stop 之后连接还在跑。
+    std::vector<std::weak_ptr<Session>> sessions;
 };
 
 std::shared_ptr<netmech::ConnHandler> ServerLinkable::on_accept(netmech::Conn& c)
@@ -652,6 +669,14 @@ std::shared_ptr<netmech::ConnHandler> ServerLinkable::on_accept(netmech::Conn& c
     auto session = std::make_shared<Session>(impl->handler, impl->cfg);
     {
         std::lock_guard<std::mutex> lk(impl->mu);
+        // 顺手剪掉已失效的弱引用：否则长跑进程的 sessions 会随着连接数
+        // 只增不减（每条已关闭连接留下一个 16 字节的空壳）。
+        if (impl->sessions.size() > 64) {
+            impl->sessions.erase(
+                std::remove_if(impl->sessions.begin(), impl->sessions.end(),
+                               [](const std::weak_ptr<Session>& w) { return w.expired(); }),
+                impl->sessions.end());
+        }
         impl->sessions.push_back(session);
     }
     return session;
@@ -730,6 +755,19 @@ void Server::stop() noexcept
         m_impl->mech->unlisten(addr);
     }
     m_impl->linkable.reset();
+
+    // 关掉已经建立的连接：`unlisten` 只停 accept，不动既有连接。
+    // 不发这一步的话 stop() 之后这些 h2 连接还会继续收发 —— 与"停服"的
+    // 语义不符，也让"重启后端口变了但旧连接还在"这种状态变得无法解释。
+    {
+        std::lock_guard<std::mutex> lk(m_impl->mu);
+        for (auto& weak : m_impl->sessions) {
+            if (auto s = weak.lock()) {
+                s->shutdown_gracefully();   // 先发 GOAWAY，再关闭
+            }
+        }
+        m_impl->sessions.clear();
+    }
 
     // 清掉实际绑定地址：否则 `local()` 在 stop 之后还会报上一个端口的旧值，
     // 而端口 0 的监听器重启后拿到的是**新**端口 —— 那是个很难查的"地址说谎"。

@@ -28,7 +28,7 @@
 |---|---|---|
 | S0 | 仓库骨架 + 错误码 + 最小 CI | ✅ 完成 |
 | S1 | h2 语义转换层（`h2/headers.hpp`：伪头/逐跳头/path/authority/content-length） | ✅ 完成 |
-| S2 | h2c 服务端闭环（nghttp2 驱动 + 读写泵 + 正文回环 + trailers） | ✅ 完成（23 用例 / 171 断言，gcc+clang+MSVC） |
+| S2 | h2c 服务端闭环（nghttp2 驱动 + 读写泵 + 正文回环 + trailers + stop 关连接） | ✅ 完成（24 用例 / 177 断言，gcc+clang+MSVC，零告警） |
 | S3 | 多流与生命周期（流表、RST/GOAWAY/SETTINGS、块池、反压） | ⏳ 下一步 |
 | S4 | TLS + ALPN（`{"h2","http/1.1"}`，自签 + 指纹 pin） | ⏳ |
 | S5 | gRPC wire 客户端（帧、`grpc-status`、deadline） | ⏳ |

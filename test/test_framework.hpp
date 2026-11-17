@@ -103,6 +103,14 @@ inline int run_all(const std::string& filter)
 
 #define CHECK(expr) H2MECH_CHECK_IMPL(expr, #expr)
 
+/// 带自定义说明的断言（失败时把上下文一起打出来，省一次复跑）。
+///
+/// 用 `std::string(msg).c_str()` 而不是直接把 msg 交给 `%s`：
+/// 调用方既可能传字面量，也可能传 `std::string`（如 std::to_string(...)），
+/// 后者直接进 printf 是 UB（GCC 会报 -Wformat）。
+#define CHECK_MSG(expr, msg)                                                     \
+    H2MECH_CHECK_IMPL(expr, std::string(msg).c_str())
+
 #define CHECK_EQ(a, b)                                                           \
     do {                                                                         \
         ++::h2mech_test::checks();                                               \

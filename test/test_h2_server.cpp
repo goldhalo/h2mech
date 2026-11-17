@@ -92,7 +92,23 @@ public:
         return true;
     }
 
-    /// @return >0 读到的字节数；0 = 对端关闭；<0 = 出错
+    /// 设置接收超时（毫秒）：测"服务端 stop 后连接是否被关掉"时必须靠它，
+    /// 否则读会一直阻塞，CI 上就是一个挂死的用例。
+    void set_recv_timeout(int ms)
+    {
+#if defined(_WIN32)
+        const DWORD ms_dw = static_cast<DWORD>(ms);
+        ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO,
+                     reinterpret_cast<const char*>(&ms_dw), sizeof(ms_dw));
+#else
+        timeval tv{};
+        tv.tv_sec  = ms / 1000;
+        tv.tv_usec = (ms % 1000) * 1000;
+        ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+    }
+
+    /// @return >0 读到的字节数；0 = 对端关闭；<0 = 出错（含超时）
     int read_some(std::uint8_t* buf, std::size_t len)
     {
         return static_cast<int>(::recv(fd_, reinterpret_cast<char*>(buf),
@@ -409,6 +425,50 @@ H2MECH_TEST(h2c_trailers_are_delivered)
     CHECK(found);
 
     srv->stop();
+}
+
+H2MECH_TEST(h2c_stop_closes_live_connections)
+{
+    auto handler = std::make_shared<EchoHandler>();
+
+    h2mech::h2::Server::Config cfg;
+    cfg.local = {"127.0.0.1", 0};
+
+    auto srv = h2mech::h2::Server::create(cfg, handler);
+    REQUIRE(srv != nullptr);
+    REQUIRE(!srv->start());
+
+    // 建一条**长连接**（只发 preface + SETTINGS，不发请求），然后 stop。
+    RawConn conn;
+    REQUIRE(conn.connect(srv->local().port()));
+    conn.set_recv_timeout(3000);
+
+    const char preface_and_settings[] =
+        "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+        "\x00\x00\x00\x04\x00\x00\x00\x00\x00";   // SETTINGS（空）
+    REQUIRE(conn.write_all(reinterpret_cast<const std::uint8_t*>(preface_and_settings),
+                           sizeof(preface_and_settings) - 1));
+
+    // 先确认服务端确实在工作（能收到它的 SETTINGS）
+    std::uint8_t buf[4096];
+    REQUIRE(conn.read_some(buf, sizeof(buf)) > 0);
+
+    srv->stop();
+
+    // stop() 必须把已建立的连接关掉：读到 0（EOF）= 已关闭；
+    // 读到 -1（超时）= 连接还挂着，正是这个用例要抓的回归。
+    int  last  = -1;
+    bool eof   = false;
+    for (int i = 0; i < 8 && !eof; ++i) {
+        last = conn.read_some(buf, sizeof(buf));
+        if (last == 0) {
+            eof = true;
+        } else if (last < 0) {
+            break;   // 超时/错误：当作"没关"
+        }
+    }
+    CHECK_MSG(eof, "stop() 之后连接应当被关闭（读到 EOF），实际最后一个返回值: " +
+                       std::to_string(last));
 }
 
 H2MECH_TEST(h2c_restart_after_stop)
