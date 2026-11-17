@@ -123,6 +123,14 @@ public:
         /// 单个请求正文上限（超限 → RST_STREAM + 关闭连接）。
         std::size_t max_body_bytes = 4u << 20;
 
+        /// **单条连接**上所有流"待发响应正文"的总字节上限（默认 8 MiB）。
+        ///
+        /// 为什么需要它：`max_body_bytes` 是**每条请求**的上限，128 条并发流
+        /// 各自攒 4 MiB 就是 512 MiB —— 一个慢客户端（或故意不收的客户端）
+        /// 就能把进程撑爆。超过本上限时 `Responder::send_data` 返回 false，
+        /// 业务应当自行 `abort()`（或减少正文）。
+        std::size_t max_buffered_response_bytes = 8u << 20;
+
         /// 头部数量上限（防头部炸弹）。
         std::size_t max_headers = 64;
 

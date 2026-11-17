@@ -46,6 +46,11 @@ namespace {
 constexpr std::size_t kReadChunk      = 16 * 1024;
 constexpr std::size_t kMaxResponseBody = 16u << 20;
 
+/// 单条连接上"已从 nghttp2 取出、但还没交给 netmech 队列"的字节上限。
+/// 见 Session::flush() 的说明：没有它，一次 flush 就能把 nghttp2 里所有
+/// 待发帧搬进我们自己的 deque，对端不读时内存照样涨。
+constexpr std::size_t kMaxPendingBytes = 256 * 1024;
+
 std::string_view sv(const uint8_t* p, std::size_t n)
 {
     return std::string_view{reinterpret_cast<const char*>(p), n};
@@ -69,6 +74,7 @@ struct StreamState {
     HeaderList  trailers;
     std::string resp_body;
     std::size_t resp_offset = 0;
+    std::size_t buffered    = 0;   ///< 本流已占用的"待发正文"字节（用于连接级配额回收）
 };
 
 // =============================================================================
@@ -179,6 +185,8 @@ public:
         conn_.reset();
         streams_.clear();
         pending_out_.clear();
+        pending_bytes_       = 0;
+        resp_buffered_total_ = 0;
         if (handler_) {
             handler_->on_close();
         }
@@ -205,10 +213,17 @@ public:
         if (st == nullptr || st->responded) {
             return false;
         }
+        // 两级上限：单条流（kMaxResponseBody）+ 整条连接（配置项）。
+        // 后者是防"128 条流各攒 4 MiB"那种按并发数放大的内存占用。
         if (st->resp_body.size() + data.size() > kMaxResponseBody) {
             return false;
         }
+        if (resp_buffered_total_ + data.size() > cfg_.max_buffered_response_bytes) {
+            return false;
+        }
         st->resp_body.append(data.data(), data.size());   // 必须拷贝：调用方的内存随时可能失效
+        st->buffered += data.size();
+        resp_buffered_total_ += data.size();
         return true;
     }
 
@@ -381,7 +396,13 @@ private:
                                   void* ud)
     {
         auto* self = static_cast<Session*>(ud);
-        self->streams_.erase(id);
+        // 回收这条流占用的"待发正文"配额：否则连接级上限只增不减，
+        // 跑一段时间后所有新响应都会被误判成超限。
+        auto it = self->streams_.find(id);
+        if (it != self->streams_.end()) {
+            self->resp_buffered_total_ -= it->second.buffered;
+            self->streams_.erase(it);
+        }
         return 0;
     }
 
@@ -524,22 +545,34 @@ private:
     //  读写泵
     // -------------------------------------------------------------------------
 
-    /// 把 nghttp2 里待发的字节全部搬给 Conn（队列满就留着，等 on_write 续泵）。
+    /// 把 nghttp2 里待发的字节搬给 Conn（队列满就留着，等 on_write 续泵）。
+    ///
+    /// 反压分两层：
+    ///   · `Conn::write` 返回 false = netmech 的发送队列满 → 我们把这段留在
+    ///     `pending_out_`，**同时停止继续从 nghttp2 取**；
+    ///   · `pending_out_` 自身也有字节上限（kMaxPendingBytes）—— 只要积压超过
+    ///     它就不再 mem_send，剩下的帧留在 nghttp2 内部（它自己会管住内存）。
+    ///
+    /// 为什么必须有第二层：`Conn::write` 一次只收一段，若对端完全不读，
+    /// 我们会在一次 flush 里把 nghttp2 里所有待发帧都搬进自己的队列 ——
+    /// 那不是反压，只是把内存从 nghttp2 挪到了我们这儿。
     void flush()
     {
         if (sess_ == nullptr || !conn_) {
             return;
         }
-        // 先把上一轮没发出去的吐干净
+        // 1) 先把上一轮没发出去的吐干净
         while (!pending_out_.empty()) {
             const auto& sp = pending_out_.front();
             if (!conn_->write(netmech::ConstBuf{sp, sp->data(), sp->size()})) {
                 return;   // 队列满：留着，等 on_write
             }
+            pending_bytes_ -= sp->size();
             pending_out_.pop_front();
         }
 
-        for (;;) {
+        // 2) 再从 nghttp2 取，直到积压到上限
+        while (pending_bytes_ < kMaxPendingBytes) {
             const uint8_t* data = nullptr;
             const ssize_t  n    = nghttp2_session_mem_send(sess_, &data);
             if (n <= 0) {
@@ -549,6 +582,7 @@ private:
             auto sp = std::make_shared<std::string>(reinterpret_cast<const char*>(data),
                                                     static_cast<std::size_t>(n));
             if (!conn_->write(netmech::ConstBuf{sp, sp->data(), sp->size()})) {
+                pending_bytes_ += sp->size();
                 pending_out_.push_back(std::move(sp));
                 return;
             }
@@ -594,6 +628,8 @@ private:
     std::array<uint8_t, kReadChunk>                   rx_{};
     std::unordered_map<std::int32_t, StreamState>     streams_;
     std::deque<std::shared_ptr<std::string>>          pending_out_;
+    std::size_t                                       pending_bytes_ = 0;  ///< pending_out_ 的总字节
+    std::size_t                                       resp_buffered_total_ = 0;  ///< 所有流的待发正文合计
 };
 
 } // namespace
