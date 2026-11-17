@@ -33,7 +33,8 @@
 | S4 | h2 over TLS + ALPN（服务端强制 `h2`、非 h2 直接拒） | ✅ 完成（29 用例 / 255 断言，含真握手） |
 | S5 | gRPC wire 层 + unary 客户端（帧、`grpc-status`/trailers、`grpc-timeout`） | ✅ 完成（42 用例 / 783 断言） |
 | S6 | gRPC 服务端（方法注册、trailers、Trailers-Only） | ✅ 完成（48 用例 / 811 断言） |
-| S7 | adapter/httpmech + 同端口 h1/h2c preface 嗅探（可选） | ⏳ |
+| S7 | 同端口 h1/h2c preface 嗅探 | ✅ 完成（纯函数 + 6 用例） |
+| S7b | `adapter/httpmech`（h2/gRPC 挂到 httpmech 路由） | 🔶 未做（可选 target，等你评审完再定） |
 
 ## 构建
 
@@ -176,6 +177,30 @@ srv->start();
    回 HTTP 405/415（对端根本不是 gRPC 客户端，给它 grpc-status 只会更困惑）。
 3. **处理函数抛异常**会被捕获并转成 `INTERNAL`；忘记 `finish()` 由框架兜底
    —— 异常绝不允许穿透到 io 线程（那会 terminate 整个进程）。
+
+## 同端口 h1 / h2c（S7）
+
+`h2/sniff.hpp` 只提供一个**纯函数**：拿连接最前面的字节判协议。
+
+```cpp
+const auto hint = h2mech::h2::sniff_protocol(peeked);   // peeked 可以不足 24 字节
+switch (hint) {
+case h2mech::h2::ProtocolHint::need_more: /* 继续读 */ break;
+case h2mech::h2::ProtocolHint::h2c:       h2_session.feed(peeked); break;
+case h2mech::h2::ProtocolHint::http1:     h1_parser.feed(peeked);  break;
+}
+```
+
+三个容易写错的地方：
+
+1. **必须把 `peeked` 还给选中的处理器**（`feed(peeked)`）—— 嗅探读过的字节
+   不会再从内核来一次；漏掉就是"h1 正常、h2 一上来就协议错误"。
+2. **判定是逐字节最短路径**：`G`（GET 的首字节）一进来就能判 http1，不必为每个
+   h1 连接攒满 24 字节。
+3. **本库不替你做分流**：netmech 已经把连接交给了某个 handler，谁嗅探谁 re-feed。
+
+`adapter/httpmech`（把 h2 请求直接投进 `httpmech::Router`）**没有做**：它会把两个
+库的 CI/发版绑在一起，属于"可选 target"，等评审后按需再加。
 
 ### 一个值得记住的坑：客户端必须**自己**发 SETTINGS
 
