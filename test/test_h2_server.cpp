@@ -157,17 +157,41 @@ int client_on_stream_close(nghttp2_session*, std::int32_t, std::uint32_t, void* 
     return 0;
 }
 
+/// 请求正文的来源（nghttp2 的 data provider 只给裸指针，偏移量得自己记）。
+struct BodySource {
+    std::string data;
+    std::size_t offset = 0;
+};
+
+ssize_t client_body_read(nghttp2_session*, std::int32_t, std::uint8_t* buf, std::size_t length,
+                         std::uint32_t* flags, nghttp2_data_source* source, void*)
+{
+    auto* s = static_cast<BodySource*>(source->ptr);
+    if (s == nullptr) {
+        return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+    }
+    const std::size_t left = s->data.size() - s->offset;
+    if (left == 0) {
+        *flags |= NGHTTP2_DATA_FLAG_EOF;
+        return 0;
+    }
+    const std::size_t n = (left < length) ? left : length;
+    std::memcpy(buf, s->data.data() + s->offset, n);
+    s->offset += n;
+    if (s->offset == s->data.size()) {
+        *flags |= NGHTTP2_DATA_FLAG_EOF;
+    }
+    return static_cast<ssize_t>(n);
+}
+
 /// 发一个请求并收完整响应（阻塞，直到流关闭或对端断开）。
 bool do_request(std::uint16_t port, const char* method, const char* path, const std::string& body,
                 ClientResult& out)
 {
     RawConn conn;
     if (!conn.connect(port)) {
-        std::fprintf(stderr, "[dbg] client connect failed port=%u\n",
-                     static_cast<unsigned>(port));
         return false;
     }
-    std::fprintf(stderr, "[dbg] client connected port=%u\n", static_cast<unsigned>(port));
 
     ClientCtx ctx;
     nghttp2_session_callbacks* cbs = nullptr;
@@ -195,9 +219,27 @@ bool do_request(std::uint16_t port, const char* method, const char* path, const 
          sizeof(":path") - 1, std::strlen(path), NGHTTP2_NV_FLAG_NONE},
     };
 
-    const std::int32_t id = nghttp2_submit_request(sess, nullptr, nva.data(), nva.size(),
-                                                   nullptr, nullptr);
-    bool ok = (id >= 0);
+    // ★ 客户端连接前言是 "magic + SETTINGS"（RFC 9113 §3.4）。
+    //   nghttp2 只自动发 magic，SETTINGS 必须由应用提交；漏了它，服务端会
+    //   **静默丢弃**后续 HEADERS（mem_recv 照收不误、返回全量消费，但一个回调
+    //   都不触发）—— 这个现象极易被误判成"回调注册错了"或"库有 bug"。
+    bool ok = (nghttp2_submit_settings(sess, NGHTTP2_FLAG_NONE, nullptr, 0) == 0);
+
+    // 请求正文：provider 的 source 指向一个活到本次调用结束的对象（同步驱动，
+    // 栈上就够；真正的异步客户端要按流持有它）。
+    BodySource           body_src{body, 0};
+    nghttp2_data_provider provider{};
+    nghttp2_data_provider* provider_ptr = nullptr;
+    if (!body.empty()) {
+        provider.source.ptr  = &body_src;
+        provider.read_callback = &client_body_read;
+        provider_ptr         = &provider;
+    }
+
+    const std::int32_t id = ok ? nghttp2_submit_request(sess, nullptr, nva.data(), nva.size(),
+                                                        provider_ptr, nullptr)
+                               : -1;
+    ok = ok && (id >= 0);
 
     // 先把待发字节吐给 socket（客户端前言也在这里发出）
     for (;;) {
@@ -324,13 +366,19 @@ H2MECH_TEST(h2c_post_body_roundtrip)
     REQUIRE(srv != nullptr);
     REQUIRE(!srv->start());
 
-    // 注意：当前 do_request 不发送请求体（data provider 传 nullptr），
-    // 所以这里验证的是"无正文的 POST 也能正常收尾"。带正文的用例等
-    // S3 把 data provider 接上再补（见 README 阶段表）。
+    // 带正文的 POST：请求 DATA 帧 → 服务端按块收进 Request::body → 回显。
     ClientResult r;
-    REQUIRE(do_request(srv->local().port(), "POST", "/echo", "", r));
+    REQUIRE(do_request(srv->local().port(), "POST", "/echo", std::string{"hello-body"}, r));
     CHECK_EQ(r.status, 200);
+    CHECK_EQ(r.body, std::string{"hello-body"});   // 回环一致
     CHECK_EQ(handler->last_method, std::string{"POST"});
+
+    // 大一点的正文（会跨多个 DATA 帧）：验证分块拼接没有丢字节/错序
+    std::string big(200 * 1024, 'x');
+    ClientResult r2;
+    REQUIRE(do_request(srv->local().port(), "POST", "/echo", big, r2));
+    CHECK_EQ(r2.status, 200);
+    CHECK_EQ(r2.body.size(), big.size());
 
     srv->stop();
 }
@@ -382,8 +430,18 @@ H2MECH_TEST(h2c_restart_after_stop)
     srv->stop();
     CHECK(!srv->running());
 
-    // stop() 之后不应再受理（同一个 server 重复 start 走 already_started 分支）
-    CHECK(srv->start() != std::error_code{});
+    // stop() 之后 `local()` 不能继续报旧端口（端口 0 的监听器重启后是新端口）
+    CHECK_EQ(srv->local().port(), static_cast<std::uint16_t>(0));
+
+    // 允许重启：改配置后 stop → start 是运维常见动作，没必要逼用户重建对象。
+    REQUIRE(!srv->start());
+    CHECK(srv->running());
+    CHECK(srv->local().port() != 0);
+
+    ClientResult again;
+    REQUIRE(do_request(srv->local().port(), "GET", "/b", "", again));
+    CHECK_EQ(again.status, 200);
+
     srv->stop();
 }
 

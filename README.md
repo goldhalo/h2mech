@@ -28,8 +28,8 @@
 |---|---|---|
 | S0 | 仓库骨架 + 错误码 + 最小 CI | ✅ 完成 |
 | S1 | h2 语义转换层（`h2/headers.hpp`：伪头/逐跳头/path/authority/content-length） | ✅ 完成 |
-| S2 | h2c 服务端单流闭环（preface 校验 + nghttp2 驱动 + 读写泵） | 🔬 进行中：vendored nghttp2 已就位；会话层卡在一个回调不触发的接入问题，代码暂存 `experiments/h2-session-wip/`（详见该目录 README） |
-| S3 | 多流与生命周期（流表、RST/GOAWAY/SETTINGS、块池、反压） | ⏳ |
+| S2 | h2c 服务端闭环（nghttp2 驱动 + 读写泵 + 正文回环 + trailers） | ✅ 完成（23 用例 / 171 断言，gcc+clang+MSVC） |
+| S3 | 多流与生命周期（流表、RST/GOAWAY/SETTINGS、块池、反压） | ⏳ 下一步 |
 | S4 | TLS + ALPN（`{"h2","http/1.1"}`，自签 + 指纹 pin） | ⏳ |
 | S5 | gRPC wire 客户端（帧、`grpc-status`、deadline） | ⏳ |
 | S6 | gRPC 服务端（方法注册、trailers、Trailers-Only） | ⏳ |
@@ -56,11 +56,22 @@ cmake -S . -B build -G Ninja -DNETMECH_TLS=ON -DOPENSSL_ROOT_DIR=<OpenSSL 前缀
 include/h2mech/
   common.hpp        错误码（库 / RFC 9113 §7 / gRPC 三段）
   h2/headers.hpp    h1 ⇄ h2 头字段语义转换（纯函数，可单测）
-src/h2/headers.cpp  上述规则的实现
+  h2/server.hpp     HTTP/2 服务端（Server / Handler / Responder / Request）
+src/h2/headers.cpp  头字段规则的实现
+src/h2/server.cpp   会话层：nghttp2 驱动、流表、读写泵、trailers
 test/               自带极简框架（H2MECH_TEST 自动注册）
-thirdparty/         nghttp2 源码（S2 引入）
+thirdparty/         nghttp2 源码（v1.71.0，只编 lib/）
 adapter/httpmech/   可选：h2 请求 → httpmech::HttpRequest（默认不编）
 ```
+
+### 一个值得记住的坑：客户端必须**自己**发 SETTINGS
+
+nghttp2 的客户端会话只会自动发连接前言里的 magic，**SETTINGS 帧要应用自己
+`nghttp2_submit_settings()`**（RFC 9113 §3.4 要求它是 magic 之后的第一帧）。
+漏掉它时现象极具误导性：服务端 `nghttp2_session_mem_recv` 照收不误、返回全量
+消费，但**一个回调都不触发** —— 看起来像"回调没注册"或"库有 bug"，
+实际上是服务端在等对端的 SETTINGS。`test/test_h2_server.cpp` 的
+`do_request()` 与 `src/h2/server.cpp` 的 `on_read()` 都有注释标注。
 
 测试按主题分文件，用例用 `H2MECH_TEST(name) { ... }` 自动注册：
 

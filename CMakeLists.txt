@@ -147,14 +147,12 @@ target_link_libraries(h2mech PUBLIC
 target_link_libraries(h2mech PUBLIC h2mech_compile_options)
 
 # nghttp2 是**实现细节**：公共头不引它，所以 PRIVATE。
-#
-# 目前（S1 收尾）还没有源文件用到 nghttp2 —— 会话层在 experiments/h2-session-wip
-# 里等一个未解决的接入问题（见该目录 README）。这里**先不链接**，避免给产物
-# 带进一个没人用的 300 KB 静态库；等 S2 落地时把下面三行打开即可。
-# if(H2MECH_WITH_NGHTTP2)
-#     target_compile_definitions(h2mech PRIVATE H2MECH_HAS_NGHTTP2)
-#     target_link_libraries(h2mech PRIVATE nghttp2_static)
-# endif()
+# 静态库场景下 CMake 会把它以 $<LINK_ONLY:...> 记进导出接口，使用方最终
+# 链接时仍然会自动带上（这也是为什么它必须一起 install/export）。
+if(H2MECH_WITH_NGHTTP2)
+    target_compile_definitions(h2mech PRIVATE H2MECH_HAS_NGHTTP2)
+    target_link_libraries(h2mech PRIVATE nghttp2_static)
+endif()
 
 if(H2MECH_LIBRARY_TYPE STREQUAL "SHARED")
     target_compile_definitions(h2mech PUBLIC H2MECH_SHARED)
@@ -193,10 +191,21 @@ if(H2MECH_BUILD_TESTS)
 
         # 端到端用例直接 include <nghttp2/nghttp2.h>（用它的 client 模式当对端），
         # 因此需要 nghttp2 的**使用需求**（头路径 + Windows 的 ssize_t 定义）。
-        # 会话层的端到端用例在 experiments/h2-session-wip（未接入构建）：
-        # 等它修好之后再给测试目标加 nghttp2 的头 + 宏（注意**不要**再
-        # target_link_libraries 一次 nghttp2_static，那会让同一个静态库在
-        # 可执行文件里出现两份符号）。
+        # 端到端用例要用 nghttp2 的 **client 模式**当对端，因此需要它的头与宏。
+        # ★ 但**不要**再 target_link_libraries 一次 nghttp2_static：h2mech 已经把
+        #   它静态链进去了，重复链接没有收益，只会让链接行难读。
+        if(H2MECH_WITH_NGHTTP2)
+            target_include_directories(h2mech_ut PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/nghttp2/includes")
+            target_compile_definitions(h2mech_ut PRIVATE H2MECH_HAS_NGHTTP2)
+            if(MSVC)
+                # MSVC 没有 ssize_t（nghttp2 的公开头需要它），与静态库那边一致。
+                target_compile_definitions(h2mech_ut PRIVATE
+                    ssize_t=ptrdiff_t NGHTTP2_STATICLIB)
+            else()
+                target_compile_definitions(h2mech_ut PRIVATE NGHTTP2_STATICLIB)
+            endif()
+        endif()
         add_test(NAME h2mech_ut COMMAND h2mech_ut)
 
         # 统一输出到 bin/：CI 里"失败时直接跑一遍取详细输出"用的是这个路径，

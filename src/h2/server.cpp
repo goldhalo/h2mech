@@ -51,12 +51,6 @@ std::string_view sv(const uint8_t* p, std::size_t n)
     return std::string_view{reinterpret_cast<const char*>(p), n};
 }
 
-int dbg_frame_probe(nghttp2_session*, const nghttp2_frame* f, void*)
-{
-    std::fprintf(stderr, "[dbg] FREE frame type=%u\n", static_cast<unsigned>(f->hd.type));
-    return 0;
-}
-
 // =============================================================================
 //  单条流的状态
 // =============================================================================
@@ -106,7 +100,6 @@ public:
 
     bool on_open(std::shared_ptr<netmech::Conn> ep) override
     {
-        std::fprintf(stderr, "[dbg] session on_open\n");
         conn_ = std::move(ep);
         if (!conn_) {
             return false;
@@ -131,21 +124,18 @@ public:
             return;
         }
 
-        std::fprintf(stderr, "[dbg] read n=%zu\n", n);
-        for (std::size_t i = 0; i < n && i < 64; ++i) {
-            std::fprintf(stderr, "%02x%s", rx_[i], ((i % 16) == 15) ? "\n" : " ");
-        }
-        std::fprintf(stderr, "\n");
         const ssize_t rv = nghttp2_session_mem_recv(
             sess_, rx_.data(), static_cast<std::size_t>(n));
-        std::fprintf(stderr, "[dbg] mem_recv rv=%ld sess=%p remote_max_streams=%u\n",
-                     static_cast<long>(rv), static_cast<void*>(sess_),
-                     nghttp2_session_get_remote_settings(
-                         sess_, NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS));
         if (rv < 0) {
             // ★ 客户端的连接前言（magic）不对也会走到这里：nghttp2 会返回
             //   NGHTTP2_ERR_BAD_CLIENT_MAGIC —— 所以 h2c 不需要我们手工比对
             //   preface，交给它校验更准（错误码也更细）。
+            //
+            // ★ 另一个容易误判成"库坏了"的现象：客户端**没先发 SETTINGS**
+            //   （RFC 9113 §3.4 要求 magic 之后第一帧必须是 SETTINGS）时，
+            //   nghttp2 会把后续 HEADERS 照收不误（mem_recv 返回全量消费），
+            //   但**一个回调都不触发** —— 看起来像"帧解析了却没回调"。
+            //   排查时先看对端有没有发 SETTINGS，别怀疑自己的回调注册。
             fail_protocol(rv);
             return;
         }
@@ -250,8 +240,6 @@ public:
         return true;
     }
 
-    void flush_now() { flush(); }
-
 private:
     // -------------------------------------------------------------------------
     //  nghttp2 初始化与回调
@@ -263,22 +251,16 @@ private:
         if (nghttp2_session_callbacks_new(&cbs) != 0) {
             return false;
         }
-        nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, &dbg_frame_probe);
-        // TEMP-DEBUG：其余四个先不注册
-        // nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, &Session::on_begin_headers_cb);
-        // nghttp2_session_callbacks_set_on_header_callback(cbs, &Session::on_header_cb);
-        // nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, &Session::on_data_chunk_cb);
-        // nghttp2_session_callbacks_set_on_stream_close_callback(cbs, &Session::on_stream_close_cb);
+        nghttp2_session_callbacks_set_on_begin_headers_callback(cbs, &Session::on_begin_headers_cb);
+        nghttp2_session_callbacks_set_on_header_callback(cbs, &Session::on_header_cb);
+        nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, &Session::on_data_chunk_cb);
+        nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, &Session::on_frame_recv_cb);
+        nghttp2_session_callbacks_set_on_stream_close_callback(cbs, &Session::on_stream_close_cb);
 
         const int rv = nghttp2_session_server_new(&sess_, cbs, this);
-        std::fprintf(stderr, "[dbg] server_new rv=%d sess=%p\n", rv, static_cast<void*>(sess_));
-        // ★ callbacks 对象**必须活到 session 销毁之后**。
-        //   nghttp2 内部做的是 `session->callbacks = *callbacks`（浅拷贝），
-        //   立刻 del 掉这块内存后，后续任何堆分配都可能把它复用/清零 ——
-        //   表现就是"帧解析正常（远端 SETTINGS 都生效了）但回调一个都不触发"，
-        //   而且这种错误极小规模的用例里可能侥幸不复现（实测踩过）。
+        // nghttp2 在 session_new 里做的是 `session->callbacks = *callbacks`
+        // （按值拷贝），所以这里可以立刻释放。
         cbs_ = cbs;
-        std::fprintf(stderr, "[dbg] want_read=%d\n", nghttp2_session_want_read(sess_));
         if (rv != 0) {
             sess_ = nullptr;
             return false;
@@ -309,8 +291,6 @@ private:
     static int on_begin_headers_cb(nghttp2_session* /*s*/, const nghttp2_frame* frame, void* ud)
     {
         auto* self = static_cast<Session*>(ud);
-        std::fprintf(stderr, "[dbg] begin_headers type=%u\n",
-                     static_cast<unsigned>(frame->hd.type));
         if (frame->hd.type != NGHTTP2_HEADERS) {
             return 0;   // 目前只关心 HEADERS
         }
@@ -359,12 +339,6 @@ private:
     static int on_frame_recv_cb(nghttp2_session* /*s*/, const nghttp2_frame* frame, void* ud)
     {
         auto* self = static_cast<Session*>(ud);
-        std::fprintf(stderr, "[dbg] frame type=%u flags=0x%x sid=%d\n",
-                     static_cast<unsigned>(frame->hd.type),
-                     static_cast<unsigned>(frame->hd.flags), frame->hd.stream_id);
-        if (frame->hd.type == NGHTTP2_HEADERS) {
-            std::fprintf(stderr, "[dbg]   cat=%d\n", static_cast<int>(frame->headers.cat));
-        }
 
         if (frame->hd.type == NGHTTP2_HEADERS && frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
             StreamState* st = self->find(frame->hd.stream_id);
@@ -451,7 +425,6 @@ private:
             return;
         }
         st->dispatched = true;
-        std::fprintf(stderr, "[dbg] dispatch sid=%d\n", id);
 
         if (st->body_overflow) {
             abort_stream(id, Errc::enhance_your_calm);
@@ -757,6 +730,10 @@ void Server::stop() noexcept
         m_impl->mech->unlisten(addr);
     }
     m_impl->linkable.reset();
+
+    // 清掉实际绑定地址：否则 `local()` 在 stop 之后还会报上一个端口的旧值，
+    // 而端口 0 的监听器重启后拿到的是**新**端口 —— 那是个很难查的"地址说谎"。
+    m_impl->bound = netmech::Address{};
 }
 
 netmech::Address Server::local() const
