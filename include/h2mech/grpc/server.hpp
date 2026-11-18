@@ -78,17 +78,63 @@ public:
 public:
     /// @warning 仅供库内部构造（框架在派发前建好）。不要自己 new 一个。
     ServerCall(std::string method, h2::HeaderList metadata, std::string timeout,
-               h2::Responder& out);
+               h2::StreamResponder& out);
 
 private:
 
-    std::string       method_;
-    h2::HeaderList    metadata_;
-    std::string       timeout_;
-    h2::Responder*    out_ = nullptr;
-    bool              headers_sent_ = false;
-    bool              finished_     = false;
+    std::string          method_;
+    h2::HeaderList       metadata_;
+    std::string          timeout_;
+    h2::StreamResponder* out_ = nullptr;
+    bool                 headers_sent_ = false;
+    bool                 finished_     = false;
 };
+
+// =============================================================================
+//  双向流（bidi）
+// =============================================================================
+
+/// 一次双向流调用的上下文。
+///
+/// @warning 只在**回调期间**有效（和 `ServerCall` 一样）：不要把它存起来、
+///          也不要跨线程用 —— 底层 `StreamResponder` 是每次回调新建的。
+class H2MECH_API BidiCall {
+public:
+    BidiCall(const BidiCall&)            = delete;
+    BidiCall& operator=(const BidiCall&) = delete;
+    ~BidiCall();
+
+    [[nodiscard]] const std::string& method() const noexcept { return method_; }
+    [[nodiscard]] const h2::HeaderList& metadata() const noexcept { return metadata_; }
+    [[nodiscard]] const std::string& timeout_header() const noexcept { return timeout_; }
+
+    /// 发一条响应消息（在收到任意一条请求消息的回调里都能发）。
+    bool send(std::string_view payload);
+
+    /// 结束调用（对端再来消息也不会再回调业务）。
+    bool finish(Status status, h2::HeaderList trailers = {});
+
+    [[nodiscard]] bool finished() const noexcept { return finished_; }
+
+    /// @warning 仅供库内部构造（`finished_flag` 指向框架保存的“本流是否已收尾”）。
+    BidiCall(std::string method, h2::HeaderList metadata, std::string timeout,
+             h2::StreamResponder& out, bool* finished_flag);
+
+private:
+    std::string          method_;
+    h2::HeaderList       metadata_;
+    std::string          timeout_;
+    h2::StreamResponder* out_          = nullptr;
+    bool*                finished_flag_ = nullptr;
+    bool                 finished_      = false;
+};
+
+/// 双向流处理函数：**每条请求消息回调一次**。
+///
+/// @note 对端半关闭（END_STREAM）时，若业务还没 `finish()`，框架会用 `OK` 兜底
+///       收尾 —— 这是"请求-响应式"双向流（echo/chat）最常用的形态；
+///       需要"半关闭后继续推"的场景请在那之前自己 `finish()`。
+using BidiHandler = std::function<void(BidiCall& call, const Frame& request)>;
 
 /// unary 处理函数：拿到一条请求消息，自己决定 send / finish。
 using UnaryHandler = std::function<void(ServerCall& call, const Frame& request)>;
@@ -101,17 +147,23 @@ public:
     ///       重复注册会覆盖前一个 —— 启动期的配置问题，日志里能看出来。
     void add_unary(std::string method_path, UnaryHandler handler);
 
+    /// 注册双向流方法（每条请求消息回调一次）。
+    /// @note 同一路径同时注册 unary 与 bidi 时以 bidi 优先。
+    void add_bidi_stream(std::string method_path, BidiHandler handler);
+
     [[nodiscard]] bool has(std::string_view method_path) const;
 
     /// 查找处理函数（内部/诊断用）。
     /// @return 找不到返回 nullptr；指针只在 Service 存活期间有效，**不要存**。
-    [[nodiscard]] const UnaryHandler* find(std::string_view method_path) const noexcept;
+    [[nodiscard]] const UnaryHandler* find_unary(std::string_view method_path) const noexcept;
+    [[nodiscard]] const BidiHandler*  find_bidi(std::string_view method_path) const noexcept;
 
     /// 已注册的方法数（诊断用）。
-    [[nodiscard]] std::size_t size() const noexcept { return unary_.size(); }
+    [[nodiscard]] std::size_t size() const noexcept { return unary_.size() + bidi_.size(); }
 
 private:
     std::unordered_map<std::string, UnaryHandler> unary_;
+    std::unordered_map<std::string, BidiHandler>  bidi_;
 };
 
 /// gRPC 服务端配置。

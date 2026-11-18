@@ -585,15 +585,21 @@ public:
     //  流式：响应侧
     // -------------------------------------------------------------------------
 
+    /// 记录响应头，但**先不提交** —— 这样"只发状态、不发正文"才能走成
+    /// 真正的 Trailers-Only（HEADERS 直接带 END_STREAM），而不是"空 DATA + 结束"。
+    /// 真正提交发生在第一次 write() 或 finish()。
     bool stream_send_headers(std::int32_t id, int status, const HeaderList& headers)
     {
         StreamState* st = find(id);
         if (st == nullptr || st->resp_submitted || st->writer_eof) {
             return false;
         }
+        if (st->status != 0) {
+            return true;   // 已经设过，忽略重复
+        }
         st->status       = status;
         st->resp_headers = headers;
-        return submit_streaming(id, st);
+        return true;
     }
 
     bool stream_write(std::int32_t id, std::string_view data)
