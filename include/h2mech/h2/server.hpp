@@ -106,6 +106,92 @@ public:
     virtual void on_protocol_error(std::error_code ec) { (void)ec; }
 };
 
+// =============================================================================
+//  流式接口（bidi / 服务端流 / 客户端流）
+// =============================================================================
+//  与上面的 `Handler`（**整包**：收齐请求体才回调一次、响应攒齐才发）相对，
+//  这一套是"边收边发"：
+//
+//    on_open()  ──► on_data() × N ──► on_data(end_stream=true)
+//         │                                  │
+//         └────► out.write() 可以在任意时刻调用（哪怕请求还没收完）
+//
+//  这才是 gRPC 双向流的地基：请求消息到达即交付，响应不必等请求结束。
+//
+//  ★ 全部回调都在该连接的 io 线程上，串行执行 —— 不需要加锁。
+//  ★ `out` 只在回调期间有效；但允许**跨回调**多次 `write()`（同一个流）。
+// =============================================================================
+
+/// 流式请求头（没有 body）。
+struct StreamRequest {
+    std::string method;      ///< 大写
+    std::string url;         ///< 不含 query
+    std::string query;
+    std::string authority;
+    std::string scheme;
+    HeaderList  headers;     ///< 小写名；已回填 host
+};
+
+/// 流式响应写出器（同一流的多次 write 之间保持顺序）。
+///
+/// @note 只有第一次 `write()`（或 `send_headers()`）才真正提交响应头；
+///       在那之前业务仍然可以选择"只发状态、不发正文"（Trailers-Only 的前提）。
+class H2MECH_API StreamResponder {
+public:
+    StreamResponder(const StreamResponder&)            = delete;
+    StreamResponder& operator=(const StreamResponder&) = delete;
+
+    /// 显式发响应头（status + headers）。不调用时由第一次 write 自动发 200。
+    /// @return false = 该流已作废
+    bool send_headers(int status, const HeaderList& headers = {});
+
+    /// 发一段响应正文（可多次、可跨回调）。
+    /// @note 内部走 nghttp2 的 deferred data provider：积压由 h2 流控与
+    ///       netmech 的发送队列共同兜住，业务不需要自己节流。
+    bool write(std::string_view data);
+
+    /// 结束响应。此前若没发过头/正文 ⇒ 直接以 HEADERS(END_STREAM) 收尾。
+    bool finish(const HeaderList& trailers = {});
+
+    /// 中止该流（RST_STREAM）。
+    bool abort(Errc code);
+
+    [[nodiscard]] std::int32_t stream_id() const noexcept { return stream_id_; }
+
+    /// @warning 仅供库内部构造。
+    StreamResponder(std::int32_t stream_id, void* session_state) noexcept
+        : stream_id_(stream_id), state_(session_state)
+    {
+    }
+
+private:
+    std::int32_t stream_id_;
+    void*        state_;
+};
+
+/// 流式处理器。
+class H2MECH_API StreamHandler {
+public:
+    virtual ~StreamHandler() = default;
+
+    /// 请求头到达。可以在这里就 `out.write()`（服务端流），也可以等消息。
+    virtual void on_open(const StreamRequest& req, StreamResponder& out) = 0;
+
+    /// 请求正文到达。`end_stream == true` 时表示对端不再发了（半关闭）。
+    ///
+    /// @param[in] out 本次流的新写出器 —— **每次回调都传一个**。
+    ///            不要缓存它：`StreamResponder` 的生命周期只到本次回调结束
+    ///            （缓存下来再用就是 use-after-free，编译器不会拦你）。
+    /// @note 数据**不缓冲**：`data` 同样只在本次回调内有效，要留就自己拷。
+    virtual void on_data(std::string_view data, bool end_stream, StreamResponder& out) = 0;
+
+    /// 连接关闭（已无在途流）。默认空实现。
+    virtual void on_close() {}
+
+    /// 协议级错误。连接随后会被关闭。
+    virtual void on_protocol_error(std::error_code ec) { (void)ec; }
+};
+
 /// HTTP/2 服务端。
 class H2MECH_API Server : public std::enable_shared_from_this<Server> {
 public:
@@ -148,6 +234,17 @@ public:
     static std::shared_ptr<Server> create(std::shared_ptr<netmech::Mechanism> mech,
                                           Config                           cfg,
                                           std::shared_ptr<Handler>         handler);
+
+    /// 流式版本（bidi / 服务端流 / 客户端流）。
+    /// @note 同一个 Server 只能用**一种**处理器：要么整包 `Handler`，
+    ///       要么流式 `StreamHandler`（混用会让"请求体是否缓冲"变得不可预测）。
+    static std::shared_ptr<Server> create(Config                            cfg,
+                                          std::shared_ptr<StreamHandler>    handler,
+                                          std::shared_ptr<netmech::Runtime> runtime = nullptr);
+
+    static std::shared_ptr<Server> create(std::shared_ptr<netmech::Mechanism> mech,
+                                          Config                            cfg,
+                                          std::shared_ptr<StreamHandler>    handler);
 
     ~Server();
 

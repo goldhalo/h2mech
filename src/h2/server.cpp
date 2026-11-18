@@ -75,6 +75,12 @@ struct StreamState {
     std::string resp_body;
     std::size_t resp_offset = 0;
     std::size_t buffered    = 0;   ///< 本流已占用的"待发正文"字节（用于连接级配额回收）
+
+    // ---- 流式响应（stream_mode_ == true 时用）----
+    std::deque<std::string> out_queue;      ///< 待发正文分片（write() 的产物）
+    bool                    resp_submitted = false;   ///< 响应头是否已经提交
+    bool                    writer_eof     = false;   ///< 业务已 finish()
+    bool                    handler_opened = false;   ///< on_open 是否已回调
 };
 
 // =============================================================================
@@ -85,6 +91,13 @@ class Session final : public netmech::ConnHandler,
 public:
     Session(std::shared_ptr<Handler> handler, Server::Config cfg)
         : handler_(std::move(handler)), cfg_(std::move(cfg))
+    {
+    }
+
+    /// 流式会话（bidi / 服务端流 / 客户端流）。
+    // 注意初始化顺序必须与成员声明一致（否则 GCC 的 -Wreorder 会当错误）
+    Session(std::shared_ptr<StreamHandler> handler, Server::Config cfg)
+        : stream_handler_(std::move(handler)), stream_mode_(true), cfg_(std::move(cfg))
     {
     }
 
@@ -358,6 +371,16 @@ private:
         if (st == nullptr) {
             return 0;
         }
+        // 流式：**不缓冲**，直接交付给业务（bidi 的地基）。
+        // 上限靠 nghttp2 的流控窗口 + netmech 的接收节奏，不在这里截断。
+        if (self->stream_mode_) {
+            if (self->stream_handler_) {
+                StreamResponder out{id, self};
+                self->stream_handler_->on_data(sv(data, len), false, out);
+            }
+            return 0;
+        }
+
         if (st->req.body.size() + len > self->cfg_.max_body_bytes) {
             st->body_overflow = true;
             return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
@@ -385,8 +408,24 @@ private:
             }
         }
 
-        if ((frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0
-            && (frame->hd.type == NGHTTP2_HEADERS || frame->hd.type == NGHTTP2_DATA)) {
+        const bool end_stream =
+            (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0
+            && (frame->hd.type == NGHTTP2_HEADERS || frame->hd.type == NGHTTP2_DATA);
+
+        // 流式会话：HEADERS 到达就 on_open（不等正文），END_STREAM 再补一次
+        // on_data(end=true) —— 这就是"边收边发"的全部机制。
+        if (self->stream_mode_) {
+            if (frame->hd.type == NGHTTP2_HEADERS
+                && frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
+                self->stream_open(frame->hd.stream_id);
+            }
+            if (end_stream) {
+                self->stream_end(frame->hd.stream_id);
+            }
+            return 0;
+        }
+
+        if (end_stream) {
             self->maybe_dispatch(frame->hd.stream_id);
         }
         return 0;
@@ -408,11 +447,52 @@ private:
 
     static ssize_t data_read_cb(nghttp2_session* s, std::int32_t id, uint8_t* buf,
                                 std::size_t length, uint32_t* flags,
-                                nghttp2_data_source* source, void* /*ud*/)
+                                nghttp2_data_source* source, void* ud)
     {
         auto* st = static_cast<StreamState*>(source->ptr);
         if (st == nullptr) {
             return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+        }
+
+        // ---- 流式：从 out_queue 里取；空了就 DEFERRED，等业务 write() 唤醒 ----
+        if (static_cast<Session*>(ud)->stream_mode_) {
+            while (!st->out_queue.empty()) {
+                std::string&      front = st->out_queue.front();
+                const std::size_t avail = front.size() - st->resp_offset;
+                if (avail == 0) {
+                    st->out_queue.pop_front();
+                    st->resp_offset = 0;
+                    continue;
+                }
+                const std::size_t n = std::min(avail, length);
+                std::memcpy(buf, front.data() + st->resp_offset, n);
+                st->resp_offset += n;
+                static_cast<Session*>(ud)->release_buffered(st, n);
+                if (st->resp_offset == front.size()) {
+                    st->out_queue.pop_front();
+                    st->resp_offset = 0;
+                }
+                if (st->out_queue.empty() && st->writer_eof) {
+                    *flags |= NGHTTP2_DATA_FLAG_EOF;
+                    if (!st->trailers.empty()) {
+                        *flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
+                        submit_trailers(s, id, st->trailers);
+                    }
+                }
+                return static_cast<ssize_t>(n);
+            }
+
+            if (!st->writer_eof) {
+                // 业务暂时没有新数据：让 nghttp2 把这条流挂起，
+                // 等 write() 里 resume_data() 再继续 —— 这就是流式反压。
+                return NGHTTP2_ERR_DEFERRED;
+            }
+            *flags |= NGHTTP2_DATA_FLAG_EOF;
+            if (!st->trailers.empty()) {
+                *flags |= NGHTTP2_DATA_FLAG_NO_END_STREAM;
+                submit_trailers(s, id, st->trailers);
+            }
+            return 0;
         }
 
         const std::size_t left = st->resp_body.size() - st->resp_offset;
@@ -453,6 +533,164 @@ private:
     // -------------------------------------------------------------------------
     //  分发与收尾
     // -------------------------------------------------------------------------
+
+public:
+    // -------------------------------------------------------------------------
+    //  流式：请求侧（StreamResponder / StreamHandler 的落点）
+    // -------------------------------------------------------------------------
+
+    /// 请求头到齐 → 回调 `StreamHandler::on_open`（**不等正文**）。
+    void stream_open(std::int32_t id)
+    {
+        StreamState* st = find(id);
+        if (st == nullptr || st->handler_opened || !stream_handler_) {
+            return;
+        }
+        if (st->body_overflow) {          // 头太多（复用这个旗标）
+            abort_stream(id, Errc::enhance_your_calm);
+            return;
+        }
+
+        RequestHeadResult parsed = build_request_head(st->raw_headers, cfg_.max_headers);
+        if (!parsed.ok()) {
+            abort_stream(id, map_headers_status(parsed.status));
+            return;
+        }
+
+        StreamRequest head;
+        head.method    = std::move(parsed.head.method);
+        head.url       = std::move(parsed.head.url);
+        head.query     = std::move(parsed.head.query);
+        head.authority = std::move(parsed.head.authority);
+        head.scheme    = std::move(parsed.head.scheme);
+        head.headers   = std::move(parsed.head.headers);
+
+        st->handler_opened = true;
+        StreamResponder out{id, this};
+        stream_handler_->on_open(head, out);
+    }
+
+    /// 对端半关闭（END_STREAM）→ 通知业务"不再有请求数据了"。
+    void stream_end(std::int32_t id)
+    {
+        StreamState* st = find(id);
+        if (st == nullptr || !st->handler_opened || !stream_handler_) {
+            return;
+        }
+        StreamResponder out{id, this};
+        stream_handler_->on_data(std::string_view{}, true, out);
+    }
+
+    // -------------------------------------------------------------------------
+    //  流式：响应侧
+    // -------------------------------------------------------------------------
+
+    bool stream_send_headers(std::int32_t id, int status, const HeaderList& headers)
+    {
+        StreamState* st = find(id);
+        if (st == nullptr || st->resp_submitted || st->writer_eof) {
+            return false;
+        }
+        st->status       = status;
+        st->resp_headers = headers;
+        return submit_streaming(id, st);
+    }
+
+    bool stream_write(std::int32_t id, std::string_view data)
+    {
+        StreamState* st = find(id);
+        if (st == nullptr || st->writer_eof) {
+            return false;
+        }
+        if (!data.empty()) {
+            // 连接级内存上限：超出时返回 false，让业务自己决定（等/放弃）。
+            if (resp_buffered_total_ + data.size() > cfg_.max_buffered_response_bytes) {
+                return false;
+            }
+            st->buffered += data.size();
+            resp_buffered_total_ += data.size();
+            st->out_queue.emplace_back(data);
+        }
+        if (!st->resp_submitted && !submit_streaming(id, st)) {
+            return false;
+        }
+        // 有数据可发了：把之前因 DEFERRED 暂停的流唤醒
+        nghttp2_session_resume_data(sess_, id);
+        flush();
+        return true;
+    }
+
+    bool stream_finish(std::int32_t id, const HeaderList& trailers)
+    {
+        StreamState* st = find(id);
+        if (st == nullptr || st->writer_eof) {
+            return false;
+        }
+        st->writer_eof = true;
+        st->trailers   = trailers;
+
+        if (!st->resp_submitted) {
+            // 从没发过正文/头 ⇒ HEADERS 直接 END_STREAM（Trailers-Only 的落点）
+            for (const auto& h : st->trailers) {
+                st->resp_headers.push_back(h);
+            }
+            st->trailers.clear();
+            return submit_streaming(id, st);
+        }
+        nghttp2_session_resume_data(sess_, id);   // 让 provider 看到 EOF
+        flush();
+        return true;
+    }
+
+    /// 提交流式响应头（带 data provider；若此刻已 writer_eof 且无待发正文，
+    /// 直接 END_STREAM 结束本次流）。
+    bool submit_streaming(std::int32_t id, StreamState* st)
+    {
+        const bool end_now = st->writer_eof && st->out_queue.empty();
+
+        // 流式响应**不发 content-length**（长度未知；发了反而会要求我们先算总长）
+        const HeaderList nv = build_response_headers(
+            ResponseHead{st->status == 0 ? 200 : st->status, st->resp_headers}, 0, false);
+
+        std::vector<nghttp2_nv> raw;
+        raw.reserve(nv.size());
+        for (const Header& h : nv) {
+            raw.push_back(make_nv(h.name, h.value));
+        }
+
+        int rv = 0;
+        if (end_now) {
+            rv = nghttp2_submit_response(sess_, id, raw.data(), raw.size(), nullptr);
+        } else {
+            nghttp2_data_provider provider{};
+            provider.source.ptr    = st;
+            provider.read_callback = &Session::data_read_cb;
+            rv = nghttp2_submit_response(sess_, id, raw.data(), raw.size(), &provider);
+        }
+        if (rv != 0) {
+            fail_protocol(static_cast<ssize_t>(rv));
+            return false;
+        }
+        st->resp_submitted = true;
+        flush();
+        return true;
+    }
+
+private:
+    /// 归还一段"待发正文"配额（流式响应在 provider 里消费后调用）。
+    void release_buffered(StreamState* st, std::size_t n) noexcept
+    {
+        if (st->buffered >= n) {
+            st->buffered -= n;
+        } else {
+            st->buffered = 0;
+        }
+        if (resp_buffered_total_ >= n) {
+            resp_buffered_total_ -= n;
+        } else {
+            resp_buffered_total_ = 0;
+        }
+    }
 
     void maybe_dispatch(std::int32_t id)
     {
@@ -619,7 +857,9 @@ private:
         return it == streams_.end() ? nullptr : &it->second;
     }
 
-    std::shared_ptr<Handler>   handler_;
+    std::shared_ptr<Handler>       handler_;
+    std::shared_ptr<StreamHandler> stream_handler_;
+    bool                           stream_mode_ = false;
     Server::Config             cfg_;
     std::shared_ptr<netmech::Conn> conn_;
     nghttp2_session*           sess_ = nullptr;
@@ -658,6 +898,29 @@ bool Responder::abort(Errc code)
 }
 
 // =============================================================================
+//  StreamResponder → Session
+// =============================================================================
+bool StreamResponder::send_headers(int status, const HeaderList& headers)
+{
+    return static_cast<Session*>(state_)->stream_send_headers(stream_id_, status, headers);
+}
+
+bool StreamResponder::write(std::string_view data)
+{
+    return static_cast<Session*>(state_)->stream_write(stream_id_, data);
+}
+
+bool StreamResponder::finish(const HeaderList& trailers)
+{
+    return static_cast<Session*>(state_)->stream_finish(stream_id_, trailers);
+}
+
+bool StreamResponder::abort(Errc code)
+{
+    return static_cast<Session*>(state_)->resp_abort(stream_id_, code);
+}
+
+// =============================================================================
 //  Server
 // =============================================================================
 namespace {
@@ -680,6 +943,7 @@ struct Server::Impl : public std::enable_shared_from_this<Server::Impl> {
     std::shared_ptr<netmech::Mechanism> mech;
     Config                              cfg;
     std::shared_ptr<Handler>            handler;
+    std::shared_ptr<StreamHandler>      stream_handler;   ///< 与 handler 二选一
     std::shared_ptr<ServerLinkable>     linkable;
     std::atomic<bool>                   running{false};
     netmech::Address                    bound{};
@@ -702,7 +966,9 @@ std::shared_ptr<netmech::ConnHandler> ServerLinkable::on_accept(netmech::Conn& c
         return nullptr;
     }
 
-    auto session = std::make_shared<Session>(impl->handler, impl->cfg);
+    auto session = impl->stream_handler
+                       ? std::make_shared<Session>(impl->stream_handler, impl->cfg)
+                       : std::make_shared<Session>(impl->handler, impl->cfg);
     {
         std::lock_guard<std::mutex> lk(impl->mu);
         // 顺手剪掉已失效的弱引用：否则长跑进程的 sessions 会随着连接数
@@ -745,6 +1011,32 @@ std::shared_ptr<Server> Server::create(std::shared_ptr<netmech::Mechanism> mech,
     srv->m_impl->mech    = std::move(mech);
     srv->m_impl->cfg     = std::move(cfg);
     srv->m_impl->handler = std::move(handler);
+    return srv;
+}
+
+std::shared_ptr<Server> Server::create(Config cfg, std::shared_ptr<StreamHandler> handler,
+                                       std::shared_ptr<netmech::Runtime> runtime)
+{
+    if (!handler) {
+        return nullptr;
+    }
+    auto mech = netmech::Mechanism::create(netmech::Mechanism::Config{}, std::move(runtime));
+    if (!mech) {
+        return nullptr;
+    }
+    return create(std::move(mech), std::move(cfg), std::move(handler));
+}
+
+std::shared_ptr<Server> Server::create(std::shared_ptr<netmech::Mechanism> mech, Config cfg,
+                                       std::shared_ptr<StreamHandler> handler)
+{
+    if (!mech || !handler) {
+        return nullptr;
+    }
+    auto srv                  = std::shared_ptr<Server>(new Server());
+    srv->m_impl->mech         = std::move(mech);
+    srv->m_impl->cfg          = std::move(cfg);
+    srv->m_impl->stream_handler = std::move(handler);
     return srv;
 }
 
