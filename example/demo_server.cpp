@@ -30,7 +30,8 @@ struct Options {
     std::string service = "demo-a";
     std::string bind_ip = "127.0.0.1";
     std::uint16_t port  = 50051;
-    std::string nacos;    ///< "host:port"，空 = 不注册
+    std::string nacos;         ///< "host:port"，空 = 不注册
+    std::string nacos_auth;    ///< "user:pass"，空 = 不鉴权
     int         run_for = 0;   ///< >0 = 跑这么多秒后退出（0 = 等回车）
 
     bool parse(int argc, char** argv)
@@ -53,6 +54,8 @@ struct Options {
                 nacos = v;
             } else if (a == "--run-for" && next(v)) {
                 run_for = std::atoi(v.c_str());
+            } else if (a == "--nacos-auth" && next(v)) {
+                nacos_auth = v;
             } else if (a == "--ip" && next(v)) {
                 bind_ip = v;
             } else if (a == "--help" || a == "-h") {
@@ -121,11 +124,28 @@ int main(int argc, char** argv)
 
         registry = std::make_unique<demo::NacosRegistry>(host, port);
         std::string err;
+
+        // 鉴权（可选的 --nacos-auth user:pass）
+        if (!opt.nacos_auth.empty()) {
+            const auto c = opt.nacos_auth.find(':');
+            registry->set_credentials(opt.nacos_auth.substr(0, c),
+                                      opt.nacos_auth.substr(c == std::string::npos ? 0 : c + 1));
+            if (registry->login(err)) {
+                std::cout << "  Nacos 登录成功\n";
+            } else {
+                std::cerr << "  Nacos 登录失败: " << err << "\n";
+            }
+        }
+
         registered = registry->register_service(opt.service, opt.bind_ip, bound.port(), err);
         if (registered) {
             std::cout << "  已注册到 Nacos " << opt.nacos << "（服务名 " << opt.service << "）\n";
         } else {
             std::cerr << "  注册 Nacos 失败: " << err << "（继续以直连模式服务）\n";
+            if (err.find("501") != std::string::npos) {
+                std::cerr << "  ↑ 501 = 该 Nacos 关闭了 v1 命名 OpenAPI（3.x 默认）。\n"
+                             "    两种办法：① 换 2.x 镜像；② 在 3.x 上把 v1 API 打开。\n";
+            }
         }
     }
 

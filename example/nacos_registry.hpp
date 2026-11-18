@@ -92,11 +92,19 @@ public:
         const std::string head = resp.substr(0, pos);
         const std::string b    = resp.substr(pos + 4);
 
-        // 状态码非 2xx 视为失败（Nacos 失败时也会把原因放在 body 里）
-        if (head.find(" 2") == std::string::npos) {
+        // 状态码必须从**首行**解析。
+        // ★ 不要写成 `head.find(" 2")`：响应头里的 `Date: ... Nov 2026` 就带 " 2"，
+        //   于是 501 也会被判成成功 —— 表现是"注册成功"的日志配着实际 501，
+        //   比直接失败更难查（这个坑真踩过，`demo_server` 一度谎报注册成功）。
+        int code = 0;
+        const auto sp = head.find(' ');
+        if (sp != std::string::npos) {
+            code = std::atoi(head.c_str() + sp + 1);
+        }
+        if (code < 200 || code >= 300) {
             err = head.substr(0, head.find("\r\n"));
-            if (err.empty()) {
-                err = b.substr(0, 200);
+            if (b.size() > 2) {
+                err += " | " + b.substr(0, 200);
             }
             return {};
         }
@@ -182,6 +190,41 @@ public:
     {
     }
 
+    /// 设置账号密码：开了鉴权的 Nacos 要先登录换 `accessToken`。
+    void set_credentials(std::string user, std::string password)
+    {
+        user_     = std::move(user);
+        password_ = std::move(password);
+    }
+
+    /// 登录一次，缓存 accessToken（Nacos 默认 30 分钟有效，示例不做过期续期）。
+    bool login(std::string& err)
+    {
+        if (user_.empty()) {
+            return true;   // 没配账号 = 不鉴权
+        }
+        const std::string body =
+            "username=" + user_ + "&password=" + password_;
+        const std::string resp = http_.request(host_, port_, "POST", "/nacos/v1/auth/login", body, err);
+        if (resp.empty()) {
+            return false;
+        }
+        const std::string key = "\"accessToken\":\"";
+        const auto        p   = resp.find(key);
+        if (p == std::string::npos) {
+            err = "登录响应里没有 accessToken";
+            return false;
+        }
+        const auto start = p + key.size();
+        const auto end   = resp.find('"', start);
+        if (end == std::string::npos) {
+            err = "accessToken 解析失败";
+            return false;
+        }
+        token_ = resp.substr(start, end - start);
+        return true;
+    }
+
     /// 注册实例（`POST /nacos/v1/ns/instance`）。
     bool register_service(const std::string& service, const std::string& ip, std::uint16_t port,
                           std::string& err)
@@ -189,7 +232,7 @@ public:
         const std::string body = "serviceName=" + service + "&groupName=" + group_ +
                                  "&namespaceId=" + ns_ + "&ip=" + ip +
                                  "&port=" + std::to_string(port) + "&weight=1&enabled=true" +
-                                 "&healthy=true&ephemeral=true";
+                                 "&healthy=true&ephemeral=true" + auth_query();
         const std::string resp = http_.request(host_, port_, "POST", "/nacos/v1/ns/instance", body, err);
         return resp.find("ok") != std::string::npos || err.empty();
     }
@@ -200,7 +243,8 @@ public:
     {
         const std::string target = "/nacos/v1/ns/instance?serviceName=" + service +
                                    "&groupName=" + group_ + "&namespaceId=" + ns_ + "&ip=" + ip +
-                                   "&port=" + std::to_string(port) + "&ephemeral=true";
+                                   "&port=" + std::to_string(port) + "&ephemeral=true" +
+                                   auth_query();
         const std::string resp = http_.request(host_, port_, "DELETE", target, std::string{}, err);
         return resp.find("ok") != std::string::npos || err.empty();
     }
@@ -210,7 +254,7 @@ public:
     {
         const std::string target = "/nacos/v1/ns/instance/list?serviceName=" + service +
                                    "&groupName=" + group_ + "&namespaceId=" + ns_ +
-                                   "&healthyOnly=true";
+                                   "&healthyOnly=true" + auth_query();
         const std::string body = http_.request(host_, port_, "GET", target, std::string{}, err);
         return parse_hosts(body);
     }
@@ -254,10 +298,19 @@ public:
     }
 
 private:
+    /// 鉴权参数（没登录过就是空串）。
+    [[nodiscard]] std::string auth_query() const
+    {
+        return token_.empty() ? std::string{} : "&accessToken=" + token_;
+    }
+
     std::string    host_;
     std::uint16_t  port_;
     std::string    group_;
     std::string    ns_;
+    std::string    user_;
+    std::string    password_;
+    std::string    token_;
     TinyHttp       http_;
 };
 

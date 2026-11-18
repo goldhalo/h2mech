@@ -24,7 +24,8 @@ namespace {
 
 struct Options {
     std::string peer;    ///< 服务名（配 --nacos）或 host:port（直连）
-    std::string nacos;   ///< "host:port"，空 = 直连
+    std::string nacos;        ///< "host:port"，空 = 直连
+    std::string nacos_auth;   ///< "user:pass"，空 = 不鉴权
     std::string message = "hello";
     int         rounds  = 3;   ///< 双向流来回几轮
 
@@ -44,6 +45,8 @@ struct Options {
                 peer = v;
             } else if (a == "--nacos" && next(v)) {
                 nacos = v;
+            } else if (a == "--nacos-auth" && next(v)) {
+                nacos_auth = v;
             } else if (a == "--message" && next(v)) {
                 message = v;
             } else if (a == "--rounds" && next(v)) {
@@ -94,14 +97,24 @@ int main(int argc, char** argv)
                 std::atoi(opt.nacos.substr(colon == std::string::npos ? 0 : colon + 1).c_str())));
 
         std::string err;
+        if (!opt.nacos_auth.empty()) {
+            const auto c = opt.nacos_auth.find(':');
+            registry.set_credentials(opt.nacos_auth.substr(0, c),
+                                     opt.nacos_auth.substr(c == std::string::npos ? 0 : c + 1));
+            if (!registry.login(err)) {
+                std::cerr << "Nacos 登录失败: " << err << "\n";
+                return 1;
+            }
+        }
         const auto  instances = registry.discover(opt.peer, err);
         if (instances.empty()) {
             std::cerr << "从 Nacos 发现 [" << opt.peer << "] 失败";
             if (!err.empty()) {
                 std::cerr << ": " << err;
             }
-            std::cerr << "\n提示：若你的 Nacos 是 3.x（v1 OpenAPI 返回 501），"
-                         "请改用 --peer host:port 直连。\n";
+            std::cerr << "\n提示：若错误里带 501，说明该 Nacos 关闭了 v1 命名 OpenAPI"
+                         "（3.x 默认）；换 2.x 镜像或打开 v1 后再试，"
+                         "也可以先用 --peer host:port 直连验证调用链。\n";
             return 1;
         }
         host = instances.front().ip;

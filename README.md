@@ -266,8 +266,9 @@ cmake --build build --parallel
 ./build/bin/demo_client --peer 127.0.0.1:18080 --message hi --rounds 3
 
 # 通过 Nacos（注册 + 发现）
-./build/bin/demo_server --service demo-a --port 18080 --nacos 127.0.0.1:8848
-./build/bin/demo_client --peer demo-a --nacos 127.0.0.1:8848
+./build/bin/demo_server --service demo-a --port 18080 --nacos 127.0.0.1:8848 \
+                         --nacos-auth nacos:你的密码            # 开了鉴权时
+./build/bin/demo_client --peer demo-a --nacos 127.0.0.1:8848 --nacos-auth nacos:你的密码
 ```
 
 输出（实测）：
