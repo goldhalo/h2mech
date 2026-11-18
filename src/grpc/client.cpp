@@ -59,9 +59,34 @@ nghttp2_nv make_nv(const std::string& name, const std::string& value)
 
 } // namespace
 
+// =============================================================================
+//  双向流的状态（发送队列 + 收件箱 + 关闭标志）
+// =============================================================================
+//  锁：一把普通的 std::mutex，**不与 Client::Impl 的两把锁嵌套**：
+//    · 发送路径：先锁 st.mu 放数据 → **放锁** → 再拿 io_mu_ 去 resume/pump；
+//    · 接收路径：nghttp2 回调（持 io_mu_）→ 再拿 st.mu 写收件箱（io → st）；
+//  两条路径的加锁顺序都是 io → st，且不反向，所以不需要递归锁。
+struct BidiStream::Impl {
+    std::weak_ptr<Client::Impl> owner;
+    std::int32_t                id = -1;
+
+    std::mutex              mu;
+    std::condition_variable cv;
+    std::deque<std::string> out;                  ///< 待发消息（已按 gRPC 帧编码）
+    std::size_t             out_offset = 0;       ///< 队首已发字节
+    bool                    writes_closed = false;
+    bool                    closed        = false;
+    Status                  status;
+    MessageReader           reader;
+    std::vector<Frame>      inbox;
+};
+
 struct Client::Impl final : public netmech::Linkable,
                             public netmech::ConnHandler,
                             public std::enable_shared_from_this<Client::Impl> {
+    friend class BidiStream;   // 门面需要转发 send/close_writes/cancel
+    friend class Client;       // 门面需要调用 open_bidi（嵌套类的私有成员对外层不可见）
+
     Impl(std::shared_ptr<netmech::Mechanism> mech, ClientConfig cfg)
         : mech_(std::move(mech)), cfg_(std::move(cfg))
     {
@@ -114,6 +139,7 @@ struct Client::Impl final : public netmech::Linkable,
                 finish_locked(Code::unavailable, "连接已断开", false);
             }
         }
+        close_active_bidi(Code::unavailable, "连接已断开");
         cv_.notify_all();
     }
 
@@ -323,6 +349,7 @@ private:
         nghttp2_session_callbacks_set_on_header_callback(cbs, &Impl::on_header_cb);
         nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, &Impl::on_data_cb);
         nghttp2_session_callbacks_set_on_stream_close_callback(cbs, &Impl::on_stream_close_cb);
+        nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, &Impl::on_frame_recv_cb);
 
         std::lock_guard<std::mutex> lk(io_mu_);
         const int rv = nghttp2_session_client_new(&sess_, cbs, this);
@@ -402,6 +429,189 @@ private:
         return true;
     }
 
+    // -------------------------------------------------------------------------
+    //  双向流
+    // -------------------------------------------------------------------------
+
+    std::shared_ptr<BidiStream> open_bidi(std::string_view method_path,
+                                          h2::HeaderList metadata,
+                                          std::chrono::milliseconds timeout)
+    {
+        const auto tmo = (timeout.count() > 0) ? timeout : cfg_.default_timeout;
+        {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            if (in_flight_) {
+                return nullptr;   // 串行：已有调用在跑
+            }
+            in_flight_ = true;
+            done_      = false;
+            resp_headers_.clear();
+            trailers_.clear();
+            http_status_ = 0;
+        }
+
+        if (!ensure_connected(tmo)) {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            in_flight_ = false;
+            return nullptr;
+        }
+
+        auto st   = std::make_shared<BidiStream::Impl>();
+        st->owner = shared_from_this();
+
+        // 先挂上再提交：否则"提交后、挂上之前"到达的响应会被当成 unary 处理
+        {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            active_bidi_ = st;
+        }
+
+        if (!submit_bidi(method_path, metadata, tmo, *st)) {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            active_bidi_.reset();
+            in_flight_ = false;
+            return nullptr;
+        }
+        return std::shared_ptr<BidiStream>(new BidiStream(st));
+    }
+
+    bool submit_bidi(std::string_view method_path, const h2::HeaderList& metadata,
+                     std::chrono::milliseconds tmo, BidiStream::Impl& st)
+    {
+        std::vector<nghttp2_nv>  nva;
+        std::vector<std::string> names;
+        std::vector<std::string> values;
+        names.reserve(8 + metadata.size());
+        values.reserve(8 + metadata.size());
+        auto add = [&](std::string name, std::string value) {
+            names.push_back(std::move(name));
+            values.push_back(std::move(value));
+            nva.push_back(make_nv(names.back(), values.back()));
+        };
+
+        const std::string authority =
+            cfg_.authority.empty() ? cfg_.remote.to_string() : cfg_.authority;
+
+        add(":method", "POST");
+        add(":scheme", cfg_.tls ? "https" : "http");
+        add(":path", std::string(method_path));
+        add(":authority", authority);
+        add("content-type", "application/grpc");
+        add("te", "trailers");
+        if (const std::string t = encode_timeout(tmo); !t.empty()) {
+            add("grpc-timeout", t);
+        }
+        for (const h2::Header& field : metadata) {
+            const std::string n = h2::ascii_lower(field.name);
+            if (n.empty() || h2::is_pseudo_header(n) || h2::is_hop_by_hop(n)
+                || n == "content-type") {
+                continue;
+            }
+            add(n, field.value);
+        }
+
+        std::lock_guard<std::mutex> lk(io_mu_);
+        if (sess_ == nullptr || !conn_) {
+            return false;
+        }
+
+        nghttp2_data_provider provider{};
+        provider.source.ptr    = &st;
+        provider.read_callback = &Impl::bidi_read_cb;
+
+        st.id = nghttp2_submit_request(sess_, nullptr, nva.data(), nva.size(), &provider, nullptr);
+        if (st.id < 0) {
+            return false;
+        }
+        pump_locked();
+        return true;
+    }
+
+    bool bidi_send(BidiStream::Impl& st, std::string_view payload)
+    {
+        std::string encoded = encode_message(payload);
+        {
+            std::lock_guard<std::mutex> lk(st.mu);
+            if (st.closed || st.writes_closed) {
+                return false;
+            }
+            st.out.push_back(std::move(encoded));
+        }   // ★ 先放锁再拿 io_mu_（顺序固定 io → st，绝不反向）
+
+        std::lock_guard<std::mutex> lk(io_mu_);
+        if (sess_ == nullptr) {
+            return false;
+        }
+        nghttp2_session_resume_data(sess_, st.id);
+        pump_locked();
+        return true;
+    }
+
+    void bidi_close_writes(BidiStream::Impl& st)
+    {
+        {
+            std::lock_guard<std::mutex> lk(st.mu);
+            st.writes_closed = true;
+        }
+        std::lock_guard<std::mutex> lk(io_mu_);
+        if (sess_ != nullptr && st.id > 0) {
+            nghttp2_session_resume_data(sess_, st.id);
+            pump_locked();
+        }
+    }
+
+    void bidi_cancel(BidiStream::Impl& st)
+    {
+        std::int32_t id = -1;
+        {
+            std::lock_guard<std::mutex> lk(st.mu);
+            if (st.closed) {
+                return;
+            }
+            id = st.id;
+        }
+        std::lock_guard<std::mutex> lk(io_mu_);
+        if (sess_ != nullptr && id > 0) {
+            nghttp2_submit_rst_stream(sess_, NGHTTP2_FLAG_NONE, id, NGHTTP2_CANCEL);
+            pump_locked();
+        }
+    }
+
+    /// 请求正文来源：从 `BidiStream::Impl` 的待发队列里取。
+    static ssize_t bidi_read_cb(nghttp2_session*, std::int32_t, std::uint8_t* buf,
+                                std::size_t length, std::uint32_t* flags,
+                                nghttp2_data_source* source, void* /*ud*/)
+    {
+        auto* st = static_cast<BidiStream::Impl*>(source->ptr);
+        if (st == nullptr) {
+            return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
+        }
+        std::lock_guard<std::mutex> lk(st->mu);
+
+        while (!st->out.empty()) {
+            std::string&      front = st->out.front();
+            const std::size_t avail = front.size() - st->out_offset;
+            if (avail == 0) {
+                st->out.pop_front();
+                st->out_offset = 0;
+                continue;
+            }
+            const std::size_t n = (avail < length) ? avail : length;
+            std::memcpy(buf, front.data() + st->out_offset, n);
+            st->out_offset += n;
+            if (st->out_offset == front.size()) {
+                st->out.pop_front();
+                st->out_offset = 0;
+            }
+            return static_cast<ssize_t>(n);
+        }
+
+        if (!st->writes_closed) {
+            return NGHTTP2_ERR_DEFERRED;   // 业务暂时没新消息：挂起，等 send() 唤醒
+        }
+        *flags |= NGHTTP2_DATA_FLAG_EOF;
+        return 0;
+    }
+
     void cancel_stream()
     {
         std::lock_guard<std::mutex> lk(io_mu_);
@@ -462,6 +672,29 @@ private:
         }
     }
 
+    /// 连接断了/出错时，把当前双向流也标记为结束（否则 wait_close 会干等到超时）。
+    void close_active_bidi(Code code, std::string message)
+    {
+        std::shared_ptr<BidiStream::Impl> bs;
+        {
+            std::lock_guard<std::mutex> lk(state_mu_);
+            bs = std::move(active_bidi_);
+            active_bidi_.reset();
+            in_flight_ = false;
+        }
+        if (!bs) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(bs->mu);
+            if (!bs->closed) {
+                bs->closed = true;
+                bs->status = Status{code, std::move(message)};
+            }
+        }
+        bs->cv.notify_all();
+    }
+
     void finish_locked(Code code, std::string message, bool reached)
     {
         result_.status      = Status{code, std::move(message)};
@@ -498,13 +731,36 @@ private:
                           std::size_t len, void* ud)
     {
         auto* self = static_cast<Impl*>(ud);
+
+        // 双向流：消息进收件箱（由调用线程 take_messages() 取）
+        std::shared_ptr<BidiStream::Impl> bs;
+        {
+            std::lock_guard<std::mutex> lk(self->state_mu_);
+            bs = self->active_bidi_;
+        }
+        if (bs) {
+            std::lock_guard<std::mutex> lk(bs->mu);
+            if (!bs->reader.feed(data, len)) {
+                bs->closed = true;
+                bs->status = Status{Code::invalid_argument, "响应消息格式错误"};
+                bs->cv.notify_all();
+                return 0;
+            }
+            Frame f;
+            while (bs->reader.next(f)) {
+                bs->inbox.push_back(std::move(f));
+            }
+            bs->cv.notify_all();
+            return 0;
+        }
+
         if (!self->reader_.feed(data, len)) {
             return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;   // 帧格式错误 → 本流失败
         }
         Frame f;
         while (self->reader_.next(f)) {
             std::lock_guard<std::mutex> lk(self->state_mu_);
-            self->result_.message += f.payload;   // 目前只支持"一条消息"
+            self->result_.message += f.payload;   // unary：只有一条
         }
         return 0;
     }
@@ -512,16 +768,79 @@ private:
     static int on_stream_close_cb(nghttp2_session*, std::int32_t, std::uint32_t /*ec*/, void* ud)
     {
         auto* self = static_cast<Impl*>(ud);
+
+        std::shared_ptr<BidiStream::Impl> bs;
+        Status                            st;
         {
             std::lock_guard<std::mutex> lk(self->state_mu_);
-            if (!self->done_) {
-                self->result_.status = parse_status(self->resp_headers_, self->trailers_);
-                self->result_.reached = true;
+            bs = self->active_bidi_;
+            if (bs) {
+                st = parse_status(self->resp_headers_, self->trailers_);
+                self->active_bidi_.reset();
+                self->in_flight_ = false;
+            } else if (!self->done_) {
+                self->result_.status     = parse_status(self->resp_headers_, self->trailers_);
+                self->result_.reached    = true;
                 self->result_.http_status = self->http_status_;
-                self->done_ = true;
+                self->done_              = true;
             }
         }
+
+        if (bs) {
+            {
+                std::lock_guard<std::mutex> lk(bs->mu);
+                bs->closed = true;
+                bs->status = st;
+            }
+            bs->cv.notify_all();
+            return 0;
+        }
+
         self->cv_.notify_all();
+        return 0;
+    }
+
+    /// 响应侧 END_STREAM 到达时的收尾。
+    ///
+    /// ★ 为什么不能只靠 `on_stream_close`：**双向流**里我们的写侧可能还开着
+    ///   （队列空 + 没 close_writes），h2 的流状态是 half-closed(remote) 而不是
+    ///   closed，`on_stream_close` 根本不会触发 —— 表现就是"服务端已经答完了，
+    ///   客户端 wait_close 却一直等到超时"。
+    ///   所以这里一看到远端 END_STREAM 就主动 RST 把本流收干净。
+    static int on_frame_recv_cb(nghttp2_session* s, const nghttp2_frame* frame, void* ud)
+    {
+        auto* self = static_cast<Impl*>(ud);
+        if ((frame->hd.flags & NGHTTP2_FLAG_END_STREAM) == 0) {
+            return 0;
+        }
+        if (frame->hd.type != NGHTTP2_HEADERS && frame->hd.type != NGHTTP2_DATA) {
+            return 0;
+        }
+
+        std::shared_ptr<BidiStream::Impl> bs;
+        Status                            st;
+        {
+            std::lock_guard<std::mutex> lk(self->state_mu_);
+            bs = self->active_bidi_;
+            if (!bs) {
+                return 0;   // unary 走 on_stream_close
+            }
+            st = parse_status(self->resp_headers_, self->trailers_);
+            self->active_bidi_.reset();
+            self->in_flight_ = false;
+        }
+
+        // 请求侧还开着：主动 RST，否则流停在 half-closed(remote) 永不 close
+        nghttp2_submit_rst_stream(s, NGHTTP2_FLAG_NONE, frame->hd.stream_id, NGHTTP2_NO_ERROR);
+
+        {
+            std::lock_guard<std::mutex> lk(bs->mu);
+            if (!bs->closed) {
+                bs->closed = true;
+                bs->status = st;
+            }
+        }
+        bs->cv.notify_all();
         return 0;
     }
 
@@ -572,6 +891,7 @@ private:
     mutable std::mutex      state_mu_;
     std::condition_variable cv_;
     bool                    in_flight_      = false;
+    std::shared_ptr<BidiStream::Impl> active_bidi_;   ///< 当前双向流（串行，至多一条）
     bool                    done_           = false;
     bool                    connected_      = false;
     bool                    connecting_     = false;
@@ -630,6 +950,97 @@ void Client::close() noexcept
 bool Client::connected() const noexcept
 {
     return m_impl && m_impl->connected();
+}
+
+std::shared_ptr<BidiStream> Client::open_bidi(std::string_view method_path,
+                                             h2::HeaderList metadata,
+                                             std::chrono::milliseconds timeout)
+{
+    if (!m_impl) {
+        return nullptr;
+    }
+    return m_impl->open_bidi(method_path, std::move(metadata), timeout);
+}
+
+// =============================================================================
+//  BidiStream（门面）
+// =============================================================================
+
+BidiStream::BidiStream(std::shared_ptr<Impl> impl) : m_impl(std::move(impl)) {}
+
+BidiStream::~BidiStream() = default;
+
+bool BidiStream::send(std::string_view payload)
+{
+    if (!m_impl) {
+        return false;
+    }
+    auto owner = m_impl->owner.lock();
+    return owner && owner->bidi_send(*m_impl, payload);
+}
+
+void BidiStream::close_writes()
+{
+    if (!m_impl) {
+        return;
+    }
+    if (auto owner = m_impl->owner.lock()) {
+        owner->bidi_close_writes(*m_impl);
+    }
+}
+
+Status BidiStream::wait_close(std::chrono::milliseconds timeout)
+{
+    if (!m_impl) {
+        Status st;
+        st.code    = Code::internal;
+        st.message = "流未初始化";
+        return st;
+    }
+
+    std::unique_lock<std::mutex> lk(m_impl->mu);
+    if (timeout.count() <= 0) {
+        m_impl->cv.wait(lk, [this] { return m_impl->closed; });
+        return m_impl->status;
+    }
+    if (!m_impl->cv.wait_for(lk, timeout, [this] { return m_impl->closed; })) {
+        lk.unlock();
+        cancel();          // 超时：主动 RST，别让对端一直算
+        Status st;
+        st.code    = Code::deadline_exceeded;
+        st.message = "等待流关闭超时";
+        return st;
+    }
+    return m_impl->status;
+}
+
+std::vector<Frame> BidiStream::take_messages()
+{
+    std::vector<Frame> out;
+    if (!m_impl) {
+        return out;
+    }
+    std::lock_guard<std::mutex> lk(m_impl->mu);
+    out.swap(m_impl->inbox);
+    return out;
+}
+
+void BidiStream::cancel()
+{
+    if (m_impl) {
+        if (auto owner = m_impl->owner.lock()) {
+            owner->bidi_cancel(*m_impl);
+        }
+    }
+}
+
+bool BidiStream::closed() const noexcept
+{
+    if (!m_impl) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lk(m_impl->mu);
+    return m_impl->closed;
 }
 
 } // namespace grpc

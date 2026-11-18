@@ -39,6 +39,7 @@
 | S6 | gRPC 服务端（方法注册、trailers、Trailers-Only） | ✅ 完成（48 用例 / 811 断言） |
 | S7 | 同端口 h1/h2c preface 嗅探 | ✅ 完成（纯函数 + 6 用例） |
 | S7b | `adapter/httpmech`（h2/gRPC 挂到 httpmech 路由） | 🔶 未做（可选 target，等你评审完再定） |
+| S8 | 双向流（h2 流式 + gRPC bidi，client 与 server 都通） | ✅ 完成（61 用例 / 927 断言） |
 
 ## 构建
 
@@ -221,6 +222,38 @@ nghttp2 的客户端会话只会自动发连接前言里的 magic，**SETTINGS �
 ./build/bin/h2mech_ut              # 全部
 ./build/bin/h2mech_ut headers      # 只跑名字含 headers 的
 ```
+
+## 双向流（S8）
+
+**服务端**：每条请求消息回调一次，可以在回调里直接回一条（或多条）。
+
+```cpp
+service->add_bidi_stream("/test.Chat/Relay",
+    [](grpc::BidiCall& call, const grpc::Frame& req) {
+        call.send(req.payload);          // 收到即回，不等请求结束
+    });
+```
+
+**客户端**："发-收-等"三个方法，不回调到 io 线程（也就没有重入/线程归属问题）。
+
+```cpp
+auto s = cli->open_bidi("/test.Chat/Relay");
+s->send("ping-1");
+auto msgs = s->take_messages();     // 非阻塞取已收到的（元素是 Frame）
+s->send("ping-2");
+s->close_writes();                  // END_STREAM
+auto st = s->wait_close(std::chrono::seconds(5));
+```
+
+两个必须知道的点：
+
+1. **响应侧 END_STREAM 就收尾**：双向流里我们的写侧可能还开着（队列空、没
+   `close_writes()`），此时 h2 流停在 `half-closed(remote)`，`on_stream_close`
+   **不会**触发。所以客户端一看到远端 END_STREAM 就主动 RST 把本流收干净
+   —— 不做这一步，`wait_close()` 只能等到超时（这个坑已经踩过，用例
+   `grpc_bidi_client_unknown_method` 就是守它的）。
+2. **串行**：一个 `Client` 同时只跑一条流或一次 unary；流没关时 `call()` 返回
+   `INTERNAL`（`grpc_bidi_client_serializes_with_unary` 守着）。
 
 ## 与开源 gRPC 组件对接（下一步要验的）
 

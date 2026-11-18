@@ -16,6 +16,7 @@
 
 #include "h2mech/common.hpp"
 #include "h2mech/export.hpp"
+#include "h2mech/grpc/framer.hpp"
 #include "h2mech/grpc/status.hpp"
 #include "h2mech/h2/headers.hpp"
 
@@ -26,6 +27,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace netmech {
 class Mechanism;
@@ -75,6 +77,56 @@ struct UnaryResult {
     [[nodiscard]] bool ok() const noexcept { return reached && status.ok(); }
 };
 
+/// 一条双向流（单连接上的一条 h2 流）。
+///
+/// @par 用法（"发-收-等"模型，不回调到 io 线程）
+/// @code
+///   auto s = cli->open_bidi("/pkg.Svc/Chat");
+///   s->send("a");
+///   auto msgs = s->take_messages();        // 非阻塞取已收到的
+///   s->close_writes();                     // 不再发请求消息（END_STREAM）
+///   const auto st = s->wait_close(std::chrono::seconds(5));
+/// @endcode
+///
+/// @note 为什么不用"io 线程回调"：设备侧的双向调用就是"发完等收"，
+///       回调会逼使用者处理重入（在回调里再 send）与线程归属；
+///       `send()` / `take_messages()` / `wait_close()` 三个方法就够了，
+///       而且实现里**不需要递归锁**。
+class H2MECH_API BidiStream {
+public:
+    struct Impl;
+
+    ~BidiStream();
+
+    BidiStream(const BidiStream&)            = delete;
+    BidiStream& operator=(const BidiStream&) = delete;
+
+    /// 发一条请求消息（可多次）。
+    /// @return false = 流已关闭 / 写侧已关闭
+    bool send(std::string_view payload);
+
+    /// 关闭写侧（发 END_STREAM）：之后不能再 `send()`，但仍可继续收。
+    void close_writes();
+
+    /// 阻塞等到流关闭。
+    /// @return 最终状态；超时返回 `DEADLINE_EXCEEDED`（并且会顺手 RST_STREAM）。
+    [[nodiscard]] Status wait_close(std::chrono::milliseconds timeout);
+
+    /// 取走已收到的消息（非阻塞，取完即清空）。
+    [[nodiscard]] std::vector<Frame> take_messages();
+
+    /// 主动取消（RST_STREAM）。
+    void cancel();
+
+    [[nodiscard]] bool closed() const noexcept;
+
+    /// @warning 仅供库内部构造。
+    explicit BidiStream(std::shared_ptr<Impl> impl);
+
+private:
+    std::shared_ptr<Impl> m_impl;
+};
+
 /// gRPC unary 客户端（单连接、串行）。
 class H2MECH_API Client : public std::enable_shared_from_this<Client> {
 public:
@@ -107,6 +159,14 @@ public:
                                    std::string_view   request,
                                    h2::HeaderList     metadata = {},
                                    std::chrono::milliseconds timeout = {});
+
+    /// 开一条双向流。**同一时刻只允许一条**（本客户端是串行的）。
+    ///
+    /// @return nullptr = 已有调用在跑 / 连不上
+    /// @note 流关闭前 `call()` 会返回 `INTERNAL`（"已有调用在进行"）。
+    [[nodiscard]] std::shared_ptr<BidiStream> open_bidi(std::string_view method_path,
+                                                        h2::HeaderList metadata = {},
+                                                        std::chrono::milliseconds timeout = {});
 
     /// 关闭连接（幂等）。之后再 `call()` 会自动重连。
     void close() noexcept;
