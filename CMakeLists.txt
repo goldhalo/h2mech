@@ -260,9 +260,38 @@ install(FILES
         "${CMAKE_CURRENT_BINARY_DIR}/h2mechConfigVersion.cmake"
         DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/h2mech")
 
+# ---------------------------------------------------------------------------
+# 示例：两个可执行，演示"注册到 Nacos → 发现对端 → gRPC 互调"
+# ---------------------------------------------------------------------------
+#  默认 OFF（示例不参与库的构建/安装）。打开：
+#    cmake -S . -B build -DH2MECH_BUILD_EXAMPLES=ON
+#  然后：
+#    ./build/bin/demo_server --service demo-a --port 50051 --nacos 127.0.0.1:8848
+#    ./build/bin/demo_client --peer demo-a --nacos 127.0.0.1:8848
+#  没有 Nacos 也能跑（直连）：
+#    ./build/bin/demo_client --peer 127.0.0.1:50051
+if(H2MECH_BUILD_EXAMPLES)
+    add_executable(demo_server example/demo_server.cpp)
+    target_link_libraries(demo_server PRIVATE h2mech)
+    set_target_properties(demo_server PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+    add_executable(demo_client example/demo_client.cpp)
+    target_link_libraries(demo_client PRIVATE h2mech)
+    set_target_properties(demo_client PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+
+    # 示例会被使用者照着写 → 与库本体同一套严格告警
+    if(NETMECH_STRICT_FLAGS)
+        target_compile_options(demo_server PRIVATE ${NETMECH_STRICT_FLAGS})
+        target_compile_options(demo_client PRIVATE ${NETMECH_STRICT_FLAGS})
+    endif()
+endif()
+
 message(STATUS "")
 message(STATUS "h2mech ${PROJECT_VERSION}")
 message(STATUS "   库类型        : ${H2MECH_LIBRARY_TYPE}")
 message(STATUS "   构建测试      : ${H2MECH_BUILD_TESTS}")
+message(STATUS "   构建示例      : ${H2MECH_BUILD_EXAMPLES}")
 message(STATUS "   告警当错误    : ${H2MECH_WARNINGS_AS_ERRORS}（仅库与示例）")
 message(STATUS "")

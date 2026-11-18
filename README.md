@@ -255,6 +255,40 @@ auto st = s->wait_close(std::chrono::seconds(5));
 2. **串行**：一个 `Client` 同时只跑一条流或一次 unary；流没关时 `call()` 返回
    `INTERNAL`（`grpc_bidi_client_serializes_with_unary` 守着）。
 
+## 示例：两个服务互调（`example/`）
+
+```bash
+cmake -S . -B build -DH2MECH_BUILD_EXAMPLES=ON   # 示例默认 OFF
+cmake --build build --parallel
+
+# 直连（不需要注册中心）
+./build/bin/demo_server --service demo-a --port 18080 --run-for 25 &
+./build/bin/demo_client --peer 127.0.0.1:18080 --message hi --rounds 3
+
+# 通过 Nacos（注册 + 发现）
+./build/bin/demo_server --service demo-a --port 18080 --nacos 127.0.0.1:8848
+./build/bin/demo_client --peer demo-a --nacos 127.0.0.1:8848
+```
+
+输出（实测）：
+
+```
+直连对端 127.0.0.1:18080
+unary  → demo-a 收到: hi
+bidi   → echo:hi-0
+bidi   → echo:hi-1
+bidi   → echo:hi-2
+bidi 收尾: OK
+```
+
+`example/nacos_registry.hpp` 用 **Nacos v1 HTTP OpenAPI**（注册 `POST /nacos/v1/ns/instance`、
+发现 `GET /nacos/v1/ns/instance/list`），刻意不引第三方依赖（自带 60 行 HTTP 客户端 +
+只认 `"ip"`/`"port"` 两个字段）。
+
+> **Nacos 版本差异**：v1 的 **注册**在较新版本仍可用，但 **查询**接口已被移除
+> （返回 501），查询走 `/nacos/v3/admin/...` 且需要 `accessToken`。
+> 遇到这种情况示例会打印提示并退出；用 `--peer host:port` 直连即可先验证调用链。
+
 ## 与开源 gRPC 组件对接（下一步要验的）
 
 本库的目标是**和现成的 gRPC 生态互通**，而不是自成一套。目前的用例是本仓的
